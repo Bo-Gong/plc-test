@@ -1,21 +1,15 @@
     .text
 
     .text
-    .globl square
-square:
+    .globl foo
+foo:
     addi sp, sp, -16
     sw ra, 12(sp)
     sw fp, 8(sp)
     addi fp, sp, 16
-    sw a0, -12(fp)
 L0:
-    lw t0, -12(fp)
-    lw t1, -12(fp)
-    mul t0, t0, t1
-    sw t0, -16(fp)
-    lw a0, -16(fp)
-    j .L_epilogue_square
-.L_epilogue_square:
+    j .L_epilogue_foo
+.L_epilogue_foo:
     lw ra, -4(fp)
     lw fp, -8(fp)
     addi sp, sp, 16
@@ -29,7 +23,7 @@ main:
     sw fp, 8(sp)
     addi fp, sp, 16
 L1:
-    li a0, 25
+    li a0, 1
     j .L_epilogue_main
 .L_epilogue_main:
     lw ra, -4(fp)
