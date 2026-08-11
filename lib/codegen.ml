@@ -97,7 +97,7 @@ let emit_tac fname tac_inst map current_args =
   | Assign (x, y) ->
       load_op "t0" y map;
       store_op "t0" x map
-
+  (*
   | AssignBinOp (x, op, y, z) ->
       (match op with
        (* ================= 1. 乘法内联直接打印 ================= *)
@@ -276,9 +276,7 @@ let emit_tac fname tac_inst map current_args =
             | Ast.Mul | Ast.Div | Ast.Mod -> assert false (* 已在外部 match 处理 *)
            );
            store_op "t0" x map)
-
-  (* 支持M扩展时启用 *)
-  (*
+  *)
   | AssignBinOp (x, op, y, z) ->
       load_op "t0" y map;
       load_op "t1" z map;
@@ -297,7 +295,6 @@ let emit_tac fname tac_inst map current_args =
        | Ast.And -> Printf.printf "    and t0, t0, t1\n"
        | Ast.Or  -> Printf.printf "    or t0, t0, t1\n");
       store_op "t0" x map
-  *)
 
   | AssignUnOp (x, op, y) ->
       load_op "t0" y map;
