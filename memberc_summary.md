@@ -20,4 +20,5 @@
 bash
 dune build
 cat test/test.c(源代码相对地址) | dune exec ./_build/default/bin/main.exe(程序相对地址) > test.s(自定义标准输出)
+启动优化：cat test/test.c | dune exec ./_build/default/bin/main.exe -- -opt > test.s
 执行后即可在 bash 打开位置生成 test.s 汇编文件。
