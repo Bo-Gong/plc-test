@@ -179,7 +179,18 @@ let copy_prop (instrs: tac list) : tac list =
     | Param a -> emit (Param (subst_copy !env a))
     | Call (d, fname, n) ->
         emit (Call (d, fname, n));
-        env := List.filter (fun (k, _) -> String.length k = 0 || k.[0] <> 'V') !env;
+        (* 函数调用可能改写全局变量：除了丢弃以全局变量为目的地的拷贝事实外，
+           还要丢弃以全局变量为源的事实（如 T0 = g），否则调用后使用 T0
+           会被替换成重新读 g，读到被修改后的值。带 $ 的局部变量/参数
+           不会被被调函数修改，可以保留。 *)
+        env :=
+          List.filter
+            (fun (k, src) ->
+              (String.length k = 0 || k.[0] <> 'V')
+              && match src with
+                 | Var v -> String.contains v '$'
+                 | Const _ | Temp _ -> true)
+            !env;
         kill d
     | Return (Some a) -> emit (Return (Some (subst_copy !env a)))
     | Label l -> emit (Label l); clear ()
@@ -268,8 +279,14 @@ let substitute_operands subst = function
 
 (* Constants assigned exactly once are safe to substitute across labels.  This
    covers loop bounds such as int n = 100; while (i < n) ... without needing
-   full data-flow analysis. *)
-let single_assign_const_prop (instrs: tac list) : tac list =
+   full data-flow analysis.
+
+   仅对 Temp 和非参数的局部变量传播：
+   - 全局变量的"仅一次常量赋值"可能出现在条件分支里，或某次读发生在赋值
+     之前，直接替换会改变语义（读到的是初值）。
+   - 参数的初值来自调用方（IR 中没有对应的 Assign），若函数体内对参数做
+     一次常量赋值，赋值之前的读不能被替换成该常量。 *)
+let single_assign_const_prop (params: string list) (instrs: tac list) : tac list =
   let defs = Hashtbl.create 32 in
   let const_defs = Hashtbl.create 32 in
   let bump k =
@@ -288,15 +305,16 @@ let single_assign_const_prop (instrs: tac list) : tac list =
          | None -> ())
     | None -> ())
     instrs;
+  let is_param = function Var v -> List.mem v params | _ -> false in
   let subst = function
-    | (Temp _ | Var _) as o ->
+    | (Temp _ | Var _) as o when operand_is_local o && not (is_param o) ->
         (match op_key o with
          | Some k when Hashtbl.find_opt defs k = Some 1 ->
              (match Hashtbl.find_opt const_defs k with
               | Some n -> Const n
               | None -> o)
          | _ -> o)
-    | Const _ as c -> c
+    | o -> o
   in
   List.map (substitute_operands subst) instrs
 
@@ -973,6 +991,48 @@ let const_eval_program (prog: ir_program) : ir_program =
       | GlobalVar (_, None) | Function _ -> env)
       [] prog
   in
+  (* 程序里任何位置被赋值过的全局变量：折叠调用时，若被调函数（含传递调用）
+     读取了其中任何一个，其值在调用点可能已被调用者修改，不能用初值解释。 *)
+  let assigned_globals =
+    List.fold_left (fun s -> function
+      | Function f ->
+          List.fold_left (fun s i ->
+            match def_operand i with
+            | Some (Var v) when not (String.contains v '$') -> S.add v s
+            | _ -> s)
+            s (flatten_func f)
+      | GlobalVar _ -> s)
+      S.empty prog
+  in
+  (* 每个函数直接或通过调用传递读取的全局变量集合（含写入，保守处理） *)
+  let reads_globals = Hashtbl.create 16 in
+  List.iter (fun (fname, f) ->
+    let s = ref S.empty in
+    List.iter (iter_operands (function
+      | Var v when not (String.contains v '$') -> s := S.add v !s
+      | _ -> ())) (flatten_func f);
+    Hashtbl.replace reads_globals fname !s)
+    funcs;
+  let changed = ref true in
+  while !changed do
+    changed := false;
+    List.iter (fun (fname, f) ->
+      let cur = Hashtbl.find reads_globals fname in
+      let next =
+        List.fold_left (fun s i ->
+          match i with
+          | Call (_, callee, _) ->
+              (match Hashtbl.find_opt reads_globals callee with
+               | Some r -> S.union s r
+               | None -> s)
+          | _ -> s)
+          cur (flatten_func f)
+      in
+      if not (S.equal next cur) then (
+        Hashtbl.replace reads_globals fname next;
+        changed := true))
+      funcs
+  done;
   let rec eval_func fuel depth fname args =
     if fuel <= 0 || depth > 16 then None
     else
@@ -1083,6 +1143,9 @@ let const_eval_program (prog: ir_program) : ir_program =
           let can_fold =
             List.length call_args = nargs
             && List.for_all (function Some _ -> true | None -> false) arg_vals
+            && (match Hashtbl.find_opt reads_globals callee with
+                | Some r -> S.is_empty (S.inter r assigned_globals)
+                | None -> false)
           in
           if can_fold then
             let vals = List.map (function Some v -> v | None -> assert false) arg_vals in
@@ -1108,39 +1171,39 @@ let const_eval_program (prog: ir_program) : ir_program =
     | GlobalVar _ as g -> g)
     prog
 
-let optimize_linear instrs =
+let optimize_linear (params: string list) (instrs: tac list) : tac list =
   instrs
-  |> single_assign_const_prop
+  |> single_assign_const_prop params
   |> const_fold
   |> algebra_simplify
   |> copy_prop
   |> common_subexpr
   |> copy_prop
-  |> single_assign_const_prop
+  |> single_assign_const_prop params
   |> const_fold
   |> algebra_simplify
 
-let rec repeat_linear n instrs =
+let rec repeat_linear (params: string list) n instrs =
   if n <= 0 then instrs
   else
-    let instrs' = optimize_linear instrs in
-    if instrs' = instrs then instrs else repeat_linear (n - 1) instrs'
+    let instrs' = optimize_linear params instrs in
+    if instrs' = instrs then instrs else repeat_linear params (n - 1) instrs'
 
 let optimize_func (f: ir_func) : ir_func =
   let instrs = flatten_func f in
   let f, instrs = normalize_entry f instrs in
-  let instrs = repeat_linear 3 instrs in
+  let instrs = repeat_linear f.params 3 instrs in
   let instrs = tail_recursion f instrs in
-  let instrs = repeat_linear 3 instrs in
+  let instrs = repeat_linear f.params 3 instrs in
   let f = rebuild_func f instrs in
   let f = truncate_func f in
   let f = remove_unreachable_blocks f in
   let f = const_prop_cfg f in
-  let f = rebuild_func f (repeat_linear 2 (flatten_func f)) in
+  let f = rebuild_func f (repeat_linear f.params 2 (flatten_func f)) in
   let f = truncate_func f in
   let f = remove_unreachable_blocks f in
   let f = dce f in
-  let f = rebuild_func f (repeat_linear 2 (flatten_func f)) in
+  let f = rebuild_func f (repeat_linear f.params 2 (flatten_func f)) in
   let f = dce f in
   let f = merge_empty_blocks f in
   let f = cleanup f in

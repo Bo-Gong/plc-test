@@ -86,7 +86,7 @@ cse_out=$(printf '%s' \
     'int f(int a, int b) { int x = a * b; int y = a * b; return x + y; } int main() { return f(6, 7); }' \
     | "$COMPILER" -opt 2>&1)
 f_body=$(printf '%s' "$cse_out" | awk '/^f:/,/^\.L_epilogue_f:/')
-mul_count=$(printf '%s' "$f_body" | grep -c '^\.L_mul_loop')
+mul_count=$(printf '%s' "$f_body" | grep -c '^    mul t0, t0, t1')
 if [ "$mul_count" -eq 1 ]; then
     echo -e "${GREEN}PASS${NC}: repeated multiply computed once"
     PASS=$((PASS + 1))
@@ -101,7 +101,7 @@ echo "========== ALGEBRAIC SIMPLIFICATION =========="
 
 check "x*2 and x*0 avoid multiply helper" \
     'int f(int x) { return x * 2 + x * 0; } int main() { return f(9); }' \
-    'add t0, t0, t1' '\.L_mul_loop'
+    'add t0, t0, t1' 'mul t0'
 
 echo ""
 echo "========== LOOP OPTIMIZATION =========="
@@ -115,7 +115,7 @@ echo "========== BASIC COMBINED =========="
 
 check "combined const copy cse algebra dead code" \
     'int f(int a, int b) { int scale = 4; int x = a * scale; int y = a * scale; int dead = b * b; return x + y + 0; } int main() { return f(3, 5); }' \
-    'slli' '\.L_mul_loop'
+    'mul t0, t0, t1' '\.L_mul_loop'
 
 echo ""
 echo "========== ADVANCED GRAPH =========="
@@ -129,7 +129,7 @@ echo "========== ADVANCED MATRIX =========="
 
 check "matrix-style row-major index" \
     'const int COLS = 16; int idx(int r, int c) { int a = r * COLS + c; int b = r * COLS + c; return a + b; } int main() { return idx(2, 3); }' \
-    'slli' '\.L_mul_loop'
+    'mul t0, t0, t1' '\.L_mul_loop'
 
 echo ""
 echo "========== GLOBAL CONST PROP =========="
@@ -144,6 +144,21 @@ echo "========== CONST EXPR CHAIN =========="
 check "global const expression chain collapsed" \
     'const int A = 2; const int B = A * 3; const int C = B + 4; const int D = C * C; int main() { return D; }' \
     'li a0, 100' '\.L_mul_loop'
+
+echo ""
+echo "========== GLOBAL / PARAM CORRECTNESS =========="
+
+check "global read before conditional write keeps memory read" \
+    'int g = 3; int f(int c) { int x = g; if (c) g = 5; return x; } int main() { return f(0); }' \
+    'call f' 'li a0, 5'
+
+check "global write before call is not folded away" \
+    'int g = 0; int h(int x) { return g; } int main() { g = 1; return h(1); }' \
+    'call h' 'li a0, 0'
+
+check "param reassignment does not affect earlier reads" \
+    'int f(int x) { int y = x; x = 5; return y; } int main() { return f(7); }' \
+    'li a0, 7' 'li a0, 5'
 
 echo ""
 echo "========== TAIL RECURSION =========="
