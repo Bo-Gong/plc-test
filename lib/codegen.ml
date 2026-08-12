@@ -91,30 +91,503 @@ let store_op reg op map =
         (Printf.printf "    la t3, %s\n" name;
          Printf.printf "    sw %s, 0(t3)\n" reg)
 
+(* ============================================================ *)
+(* 辅助函数 *)
+(* ============================================================ *)
+
+(* 检查是否为 2 的幂 *)
+let is_power_of_two n = n > 0 && (n land (n - 1)) = 0
+
+(* 计算 2 的幂的指数 *)
+let log2 n =
+  let rec loop acc x =
+    if x = 1 then acc
+    else loop (acc + 1) (x / 2)
+  in
+  loop 0 n
+
+(* ============================================================ *)
+(* 优化的二元运算代码生成 *)
+(* ============================================================ *)
+
+(* 1. 加法优化 *)
+let emit_add dest src1 src2 map =
+  match src1, src2 with
+  | Const 0, nonconst ->  (* x + 0 = x *)
+      load_op "t0" nonconst map;
+      store_op "t0" dest map
+  | nonconst, Const 0 ->  (* 0 + x = x *)
+      load_op "t0" nonconst map;
+      store_op "t0" dest map
+  
+  | Const c, nonconst when c >= -2048 && c <= 2047 ->
+      (* 立即数在 12 位范围内，使用 addi *)
+      load_op "t0" nonconst map;
+      Printf.printf "    addi t0, t0, %d\n" c;
+      store_op "t0" dest map
+  | nonconst, Const c when c >= -2048 && c <= 2047 ->
+      load_op "t0" nonconst map;
+      Printf.printf "    addi t0, t0, %d\n" c;
+      store_op "t0" dest map
+  
+  | Const a, Const b ->
+      (* 常量折叠 *)
+      let result = a + b in
+      Printf.printf "    li t0, %d\n" result;
+      store_op "t0" dest map
+  
+  | _ ->
+      (* 通用加法 *)
+      load_op "t0" src1 map;
+      load_op "t1" src2 map;
+      Printf.printf "    add t0, t0, t1\n";
+      store_op "t0" dest map
+
+(* 2. 减法优化 *)
+let emit_sub dest src1 src2 map =
+  match src1, src2 with
+  | nonconst, Const 0 ->
+      (* x - 0 = x *)
+      load_op "t0" nonconst map;
+      store_op "t0" dest map
+  
+  | Const 0, nonconst ->
+      (* 0 - x = -x *)
+      load_op "t0" nonconst map;
+      Printf.printf "    neg t0, t0\n";
+      store_op "t0" dest map
+  
+  | nonconst, Const c when c >= -2048 && c <= 2047 ->
+      (* x - c = x + (-c)，使用 addi *)
+      load_op "t0" nonconst map;
+      Printf.printf "    addi t0, t0, %d\n" (-c);
+      store_op "t0" dest map
+  
+  | Const a, Const b ->
+      let result = a - b in
+      Printf.printf "    li t0, %d\n" result;
+      store_op "t0" dest map
+  
+  | _ ->
+      load_op "t0" src1 map;
+      load_op "t1" src2 map;
+      Printf.printf "    sub t0, t0, t1\n";
+      store_op "t0" dest map
+
+(* 3. 乘法优化：2 的幂用移位 *)
+let emit_mul dest src1 src2 map =
+  match src1, src2 with
+  | Const 0, _ ->
+      (* 乘以 0 = 0 *)
+      Printf.printf "    li t0, 0\n";
+      store_op "t0" dest map
+  | _, Const 0 ->
+      Printf.printf "    li t0, 0\n";
+      store_op "t0" dest map
+  
+  | Const 1, nonconst ->
+      (* 乘以 1 = 自身 *)
+      load_op "t0" nonconst map;
+      store_op "t0" dest map
+  | nonconst, Const 1 ->
+      load_op "t0" nonconst map;
+      store_op "t0" dest map
+  
+  | Const (-1), nonconst ->
+      (* 乘以 -1 = 取负 *)
+      load_op "t0" nonconst map;
+      Printf.printf "    neg t0, t0\n";
+      store_op "t0" dest map
+  | nonconst, Const (-1) ->
+      load_op "t0" nonconst map;
+      Printf.printf "    neg t0, t0\n";
+      store_op "t0" dest map
+  
+  | Const c, nonconst ->
+      let abs_c = abs c in
+      if is_power_of_two abs_c then
+        (let shift = log2 abs_c in
+        load_op "t0" nonconst map;
+        if shift = 0 then
+          Printf.printf "    mv t0, t0\n"
+        else
+          Printf.printf "    slli t0, t0, %d\n" shift;
+        if c < 0 then
+          Printf.printf "    neg t0, t0\n";
+        store_op "t0" dest map)
+      else if abs_c < 16 then
+        (* 小常量用加法展开 *)
+        (load_op "t0" nonconst map;
+        Printf.printf "    mv t1, t0\n";
+        for _ = 1 to abs_c - 1 do
+          Printf.printf "    add t1, t1, t0\n"
+        done;
+        Printf.printf "    mv t0, t1\n";
+        if c < 0 then
+          Printf.printf "    neg t0, t0\n";
+        store_op "t0" dest map)
+      else
+        (* 其他常量使用 MUL 指令 *)
+        (load_op "t0" src1 map;
+        load_op "t1" src2 map;
+        Printf.printf "    mul t0, t0, t1\n";
+        store_op "t0" dest map)
+  | nonconst, Const c ->
+      let abs_c = abs c in
+      if is_power_of_two abs_c then
+        (let shift = log2 abs_c in
+        load_op "t0" nonconst map;
+        if shift = 0 then
+          Printf.printf "    mv t0, t0\n"
+        else
+          Printf.printf "    slli t0, t0, %d\n" shift;
+        if c < 0 then
+          Printf.printf "    neg t0, t0\n";
+        store_op "t0" dest map)
+      else if abs_c < 16 then
+        (* 小常量用加法展开 *)
+        (load_op "t0" nonconst map;
+        Printf.printf "    mv t1, t0\n";
+        for _ = 1 to abs_c - 1 do
+          Printf.printf "    add t1, t1, t0\n"
+        done;
+        Printf.printf "    mv t0, t1\n";
+        if c < 0 then
+          Printf.printf "    neg t0, t0\n";
+        store_op "t0" dest map)
+      else
+        (* 其他常量使用 MUL 指令 *)
+        (load_op "t0" src1 map;
+        load_op "t1" src2 map;
+        Printf.printf "    mul t0, t0, t1\n";
+        store_op "t0" dest map)
+  
+  | _ ->
+      load_op "t0" src1 map;
+      load_op "t1" src2 map;
+      Printf.printf "    mul t0, t0, t1\n";
+      store_op "t0" dest map
+
+(* 4. 除法优化：除以 2 的幂用移位 *)
+let emit_div dest src1 src2 map =
+  match src1, src2 with
+  | _, Const 0 ->
+      Printf.printf "    li t0, 0\n";
+      store_op "t0" dest map
+  
+  | nonconst, Const 1 ->
+      load_op "t0" nonconst map;
+      store_op "t0" dest map
+  
+  | nonconst, Const (-1) ->
+      load_op "t0" nonconst map;
+      Printf.printf "    neg t0, t0\n";
+      store_op "t0" dest map
+  
+  | nonconst, Const c when c > 1 && is_power_of_two c ->
+      let shift = log2 c in
+      load_op "t0" nonconst map;
+      Printf.printf "    srai t0, t0, %d\n" shift;
+      store_op "t0" dest map
+  
+  | Const a, Const b when b <> 0 ->
+      let result = a / b in
+      Printf.printf "    li t0, %d\n" result;
+      store_op "t0" dest map
+  
+  | _ ->
+      load_op "t0" src1 map;
+      load_op "t1" src2 map;
+      Printf.printf "    div t0, t0, t1\n";
+      store_op "t0" dest map
+
+(* 5. 取模优化：模 2 的幂用掩码 *)
+let emit_mod dest src1 src2 map =
+  match src1, src2 with
+  | _, Const 0 ->
+      Printf.printf "    li t0, 0\n";
+      store_op "t0" dest map
+  
+  | _, Const 1 ->
+      Printf.printf "    li t0, 0\n";
+      store_op "t0" dest map
+  | _, Const (-1) ->
+      Printf.printf "    li t0, 0\n";
+      store_op "t0" dest map
+  
+  | nonconst, Const c when c > 1 && is_power_of_two c ->
+      load_op "t0" nonconst map;
+      Printf.printf "    andi t0, t0, %d\n" (c - 1);
+      store_op "t0" dest map
+  
+  | Const a, Const b when b <> 0 ->
+      let result = a mod b in
+      Printf.printf "    li t0, %d\n" result;
+      store_op "t0" dest map
+  
+  | _ ->
+      load_op "t0" src1 map;
+      load_op "t1" src2 map;
+      Printf.printf "    rem t0, t0, t1\n";
+      store_op "t0" dest map
+
+(* 6. 相等比较优化 *)
+let emit_eq dest src1 src2 map =
+  match src1, src2 with
+  | Const 0, nonconst ->
+      load_op "t0" nonconst map;
+      Printf.printf "    seqz t0, t0\n";
+      store_op "t0" dest map
+  | nonconst, Const 0 ->
+      load_op "t0" nonconst map;
+      Printf.printf "    seqz t0, t0\n";
+      store_op "t0" dest map
+  
+  | Const a, Const b ->
+      Printf.printf "    li t0, %d\n" (if a = b then 1 else 0);
+      store_op "t0" dest map
+  
+  | _ ->
+      load_op "t0" src1 map;
+      load_op "t1" src2 map;
+      Printf.printf "    xor t0, t0, t1\n";
+      Printf.printf "    seqz t0, t0\n";
+      store_op "t0" dest map
+
+(* 7. 不等比较优化 *)
+let emit_ne dest src1 src2 map =
+  match src1, src2 with
+  | Const 0, nonconst ->
+      load_op "t0" nonconst map;
+      Printf.printf "    snez t0, t0\n";
+      store_op "t0" dest map
+  | nonconst, Const 0 ->
+      load_op "t0" nonconst map;
+      Printf.printf "    snez t0, t0\n";
+      store_op "t0" dest map
+  
+  | Const a, Const b ->
+      Printf.printf "    li t0, %d\n" (if a <> b then 1 else 0);
+      store_op "t0" dest map
+  
+  | _ ->
+      load_op "t0" src1 map;
+      load_op "t1" src2 map;
+      Printf.printf "    xor t0, t0, t1\n";
+      Printf.printf "    snez t0, t0\n";
+      store_op "t0" dest map
+
+(* 8. 小于比较优化 *)
+let emit_lt dest src1 src2 map =
+  match src1, src2 with
+  | Const 0, nonconst ->
+      load_op "t0" nonconst map;
+      Printf.printf "    slti t0, t0, 1\n";
+      Printf.printf "    xori t0, t0, 1\n";
+      store_op "t0" dest map
+  
+  | nonconst, Const 0 ->
+      load_op "t0" nonconst map;
+      Printf.printf "    srli t0, t0, 31\n";
+      store_op "t0" dest map
+  
+  | nonconst, Const c when c >= -2048 && c <= 2047 ->
+      load_op "t0" nonconst map;
+      Printf.printf "    slti t0, t0, %d\n" c;
+      store_op "t0" dest map
+  
+  | Const a, Const b ->
+      Printf.printf "    li t0, %d\n" (if a < b then 1 else 0);
+      store_op "t0" dest map
+  
+  | _ ->
+      load_op "t0" src1 map;
+      load_op "t1" src2 map;
+      Printf.printf "    slt t0, t0, t1\n";
+      store_op "t0" dest map
+
+(* 9. 大于比较优化 *)
+let emit_gt dest src1 src2 map =
+  match src1, src2 with
+  | nonconst, Const 0 ->
+      load_op "t0" nonconst map;
+      Printf.printf "    slti t0, t0, 1\n";
+      Printf.printf "    xori t0, t0, 1\n";
+      store_op "t0" dest map
+  
+  | Const 0, nonconst ->
+      load_op "t0" nonconst map;
+      Printf.printf "    srli t0, t0, 31\n";
+      store_op "t0" dest map
+  
+  | nonconst, Const c when c >= -2048 && c <= 2047 ->
+      load_op "t0" nonconst map;
+      Printf.printf "    addi t0, t0, %d\n" (-(c + 1));
+      Printf.printf "    slti t0, t0, 1\n";
+      Printf.printf "    xori t0, t0, 1\n";
+      store_op "t0" dest map
+  
+  | Const a, Const b ->
+      Printf.printf "    li t0, %d\n" (if a > b then 1 else 0);
+      store_op "t0" dest map
+  
+  | _ ->
+      load_op "t0" src1 map;
+      load_op "t1" src2 map;
+      Printf.printf "    slt t0, t1, t0\n";
+      store_op "t0" dest map
+
+(* 10. 小于等于优化 *)
+let emit_le dest src1 src2 map =
+  match src1, src2 with
+  | nonconst, Const 0 ->
+      load_op "t0" nonconst map;
+      Printf.printf "    slti t0, t0, 1\n";
+      store_op "t0" dest map
+  
+  | Const 0, nonconst ->
+      load_op "t0" nonconst map;
+      Printf.printf "    srli t0, t0, 31\n";
+      Printf.printf "    xori t0, t0, 1\n";
+      store_op "t0" dest map
+  
+  | nonconst, Const c when c >= -2048 && c <= 2047 ->
+      load_op "t0" nonconst map;
+      Printf.printf "    slti t0, t0, %d\n" (c + 1);
+      store_op "t0" dest map
+  
+  | Const a, Const b ->
+      Printf.printf "    li t0, %d\n" (if a <= b then 1 else 0);
+      store_op "t0" dest map
+  
+  | _ ->
+      load_op "t0" src1 map;
+      load_op "t1" src2 map;
+      Printf.printf "    slt t0, t1, t0\n";
+      Printf.printf "    xori t0, t0, 1\n";
+      store_op "t0" dest map
+
+(* 11. 大于等于优化 *)
+let emit_ge dest src1 src2 map =
+  match src1, src2 with
+  | nonconst, Const 0 ->
+      load_op "t0" nonconst map;
+      Printf.printf "    srli t0, t0, 31\n";
+      Printf.printf "    xori t0, t0, 1\n";
+      store_op "t0" dest map
+  
+  | Const 0, nonconst ->
+      load_op "t0" nonconst map;
+      Printf.printf "    slti t0, t0, 1\n";
+      store_op "t0" dest map
+  
+  | nonconst, Const c when c >= -2048 && c <= 2047 ->
+      load_op "t0" nonconst map;
+      Printf.printf "    addi t0, t0, %d\n" (-(c - 1));
+      Printf.printf "    slti t0, t0, 1\n";
+      Printf.printf "    xori t0, t0, 1\n";
+      store_op "t0" dest map
+  
+  | Const a, Const b ->
+      Printf.printf "    li t0, %d\n" (if a >= b then 1 else 0);
+      store_op "t0" dest map
+  
+  | _ ->
+      load_op "t0" src1 map;
+      load_op "t1" src2 map;
+      Printf.printf "    slt t0, t0, t1\n";
+      Printf.printf "    xori t0, t0, 1\n";
+      store_op "t0" dest map
+
+(* 12. 逻辑与优化 *)
+let emit_and dest src1 src2 map =
+  match src1, src2 with
+  | Const 0, _ ->
+      Printf.printf "    li t0, 0\n";
+      store_op "t0" dest map
+  | _, Const 0 ->
+      Printf.printf "    li t0, 0\n";
+      store_op "t0" dest map
+  
+  | Const 1, nonconst ->
+      load_op "t0" nonconst map;
+      Printf.printf "    snez t0, t0\n";
+      store_op "t0" dest map
+  | nonconst, Const 1 ->
+      load_op "t0" nonconst map;
+      Printf.printf "    snez t0, t0\n";
+      store_op "t0" dest map
+  
+  | Const a, Const b ->
+      Printf.printf "    li t0, %d\n" (if a <> 0 && b <> 0 then 1 else 0);
+      store_op "t0" dest map
+  
+  | _ ->
+      load_op "t0" src1 map;
+      load_op "t1" src2 map;
+      Printf.printf "    and t0, t0, t1\n";
+      Printf.printf "    snez t0, t0\n";
+      store_op "t0" dest map
+
+(* 13. 逻辑或优化 *)
+let emit_or dest src1 src2 map =
+  match src1, src2 with
+  | Const 0, nonconst ->
+      load_op "t0" nonconst map;
+      Printf.printf "    snez t0, t0\n";
+      store_op "t0" dest map
+  | nonconst, Const 0 ->
+      load_op "t0" nonconst map;
+      Printf.printf "    snez t0, t0\n";
+      store_op "t0" dest map
+  
+  | Const 1, _ ->
+      Printf.printf "    li t0, 1\n";
+      store_op "t0" dest map
+  | _, Const 1 ->
+      Printf.printf "    li t0, 1\n";
+      store_op "t0" dest map
+  
+  | Const a, Const b ->
+      Printf.printf "    li t0, %d\n" (if a <> 0 || b <> 0 then 1 else 0);
+      store_op "t0" dest map
+  
+  | _ ->
+      load_op "t0" src1 map;
+      load_op "t1" src2 map;
+      Printf.printf "    or t0, t0, t1\n";
+      Printf.printf "    snez t0, t0\n";
+      store_op "t0" dest map
+
+(* 14. 二元运算分发 *)
+let emit_binop dest op src1 src2 map =
+  match op with
+  | Ast.Add -> emit_add dest src1 src2 map
+  | Ast.Sub -> emit_sub dest src1 src2 map
+  | Ast.Mul -> emit_mul dest src1 src2 map
+  | Ast.Div -> emit_div dest src1 src2 map
+  | Ast.Mod -> emit_mod dest src1 src2 map
+  | Ast.Eq -> emit_eq dest src1 src2 map
+  | Ast.Ne -> emit_ne dest src1 src2 map
+  | Ast.Lt -> emit_lt dest src1 src2 map
+  | Ast.Gt -> emit_gt dest src1 src2 map
+  | Ast.Le -> emit_le dest src1 src2 map
+  | Ast.Ge -> emit_ge dest src1 src2 map
+  | Ast.And -> emit_and dest src1 src2 map
+  | Ast.Or -> emit_or dest src1 src2 map
+
+(* ============================================================ *)
 (* 翻译单条 TAC 指令 *)
+(* ============================================================ *)
+
 let emit_tac fname tac_inst map current_args =
   match tac_inst with
   | Assign (x, y) ->
       load_op "t0" y map;
       store_op "t0" x map
+
   | AssignBinOp (x, op, y, z) ->
-      load_op "t0" y map;
-      load_op "t1" z map;
-      (match op with
-       | Ast.Add -> Printf.printf "    add t0, t0, t1\n"
-       | Ast.Sub -> Printf.printf "    sub t0, t0, t1\n"
-       | Ast.Mul -> Printf.printf "    mul t0, t0, t1\n"
-       | Ast.Div -> Printf.printf "    div t0, t0, t1\n"
-       | Ast.Mod -> Printf.printf "    rem t0, t0, t1\n"
-       | Ast.Eq  -> Printf.printf "    sub t0, t0, t1\n    seqz t0, t0\n"
-       | Ast.Ne  -> Printf.printf "    sub t0, t0, t1\n    snez t0, t0\n"
-       | Ast.Lt  -> Printf.printf "    slt t0, t0, t1\n"
-       | Ast.Gt  -> Printf.printf "    slt t0, t1, t0\n"
-       | Ast.Le  -> Printf.printf "    slt t0, t1, t0\n    xori t0, t0, 1\n"
-       | Ast.Ge  -> Printf.printf "    slt t0, t0, t1\n    xori t0, t0, 1\n"
-       | Ast.And -> Printf.printf "    and t0, t0, t1\n"
-       | Ast.Or  -> Printf.printf "    or t0, t0, t1\n");
-      store_op "t0" x map
+      emit_binop x op y z map
 
   | AssignUnOp (x, op, y) ->
       load_op "t0" y map;
@@ -136,7 +609,6 @@ let emit_tac fname tac_inst map current_args =
       Printf.printf "    beqz t0, %s\n" l
 
   | Label l ->
-      (* 基本块外部有单独标签逻辑，通常 TAC 中的 Label 可在此打印或被块接管 *)
       Printf.printf "%s:\n" l
 
   | Param x ->
@@ -145,17 +617,12 @@ let emit_tac fname tac_inst map current_args =
   | Call (dest, callee, nargs) ->
       let call_args, rem = split_at nargs !current_args in
       current_args := rem;
-      (* FIX: IR 中 Params 以"最后一个实参在前"的流序出现，这里用 prepend
-         累积后恰好还原成源码顺序（首个参数在头），再按 a0..a7 顺序消费，
-         不要再反转。optimize.ml 的尾递归改写同样依赖这一约定。 *)
       let args = call_args in
       
-      (* 如果调用的函数参数超过 8 个，需要为其在 sp 低位开辟动态传参空间 *)
       let extra_space = if nargs > 8 then ((nargs - 8) * 4 + 15) / 16 * 16 else 0 in
       if extra_space > 0 then
         Printf.printf "    addi sp, sp, -%d\n" extra_space;
         
-      (* 传递参数 *)
       List.iteri (fun j arg ->
         if j < 8 then
           load_op (Printf.sprintf "a%d" j) arg map
@@ -164,14 +631,11 @@ let emit_tac fname tac_inst map current_args =
            Printf.printf "    sw t0, %d(sp)\n" ((j - 8) * 4))
       ) args;
       
-      (* 执行调用 *)
       Printf.printf "    call %s\n" callee;
       
-      (* 恢复动态开辟的传参栈空间 *)
       if extra_space > 0 then
         Printf.printf "    addi sp, sp, %d\n" extra_space;
         
-      (* 保存返回值 *)
       store_op "a0" dest map
 
   | Return (Some x) ->
@@ -189,48 +653,41 @@ let emit_block fname (b: basic_block) map current_args =
     | [] -> ()
     | inst :: rest ->
         emit_tac fname inst map current_args;
-        (* 如果是终止指令，停止输出后续指令 *)
         match inst with
-        | Return _ | Goto _ ->
-            (* 后续指令是死代码，不输出 *)
-            ()
-        | _ ->
-            emit_until_terminator rest
+        | Return _ | Goto _ -> ()
+        | _ -> emit_until_terminator rest
   in
   emit_until_terminator b.instrs
+
 (* 翻译单个函数 *)
 let emit_function (f: ir_func) =
   let slots, map = compute_offsets f in
-  (* 计算对齐 16 字节后的帧大小（8 字节用于保存 ra 和 fp） *)
   let framesize = ((8 + slots * 4 + 15) / 16) * 16 in
   
   Printf.printf "    .globl %s\n" f.fname;
   Printf.printf "%s:\n" f.fname;
   
-  (* 函数序言 (Prologue) *)
+  (* 函数序言 *)
   Printf.printf "    addi sp, sp, -%d\n" framesize;
   Printf.printf "    sw ra, %d(sp)\n" (framesize - 4);
   Printf.printf "    sw fp, %d(sp)\n" (framesize - 8);
   Printf.printf "    addi fp, sp, %d\n" framesize;
   
-  (* 将传进来的前 8 个参数从寄存器转存到本地分配的栈槽 *)
+  (* 保存参数 *)
   List.iteri (fun i name ->
     if i < 8 then
       let off = Hashtbl.find map (Var name) in
       Printf.printf "    sw a%d, %d(fp)\n" i off
   ) f.params;
 
-  (* 打印函数入口标签：尾递归优化会跳回该标签。
-     未优化时入口标签统一为 "entry"，无需打印，保持原输出。 *)
   if f.entry.label <> "entry" then
     Printf.printf "%s:\n" f.entry.label;
   
-  (* 函数体翻译 (Body) *)
   let current_args = ref [] in
   emit_block f.fname f.entry map current_args;
   List.iter (fun b -> emit_block f.fname b map current_args) f.blocks;
   
-  (* 函数结语 (Epilogue) *)
+  (* 函数结语 *)
   Printf.printf ".L_epilogue_%s:\n" f.fname;
   Printf.printf "    lw ra, -4(fp)\n";
   Printf.printf "    lw fp, -8(fp)\n";
@@ -239,7 +696,6 @@ let emit_function (f: ir_func) =
 
 (* 整个程序的代码生成主入口点 *)
 let generate_riscv (prog: ir_program) =
-  (* 打印全局段声明 *)
   Printf.printf "    .text\n\n";
 
   List.iter (function
