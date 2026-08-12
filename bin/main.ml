@@ -27,7 +27,8 @@ let () =
         let ir =
           if optimize_enabled then Lib.Optimize.optimize_program ir else ir
         in
-        
+        Printf.printf "Semantic check success!\n";
+        Lib.Ir.dump_ir ir ;
         (* 调用汇编代码生成器，将 RV32I 汇编流打印到标准输出 *)
         Lib.Codegen.generate_riscv ir
     );
