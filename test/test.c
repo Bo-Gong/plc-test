@@ -1,14 +1,12 @@
-// 测试算术运算优化
+// 测试大整数常量（超出 12 位立即数范围）
 int main() {
-    int a = 10;
-    int b = 5;
-    int c = 3;
+    int a = 32767;
+    int b = 32768;
+    int c = 65535;
     int result=0;
     
-    // 测试加法优化：x + 5
-    result = a *4;
-    
-    
+    result = a + b + c;
+    result = result % 10000;
     
     return result;
 }
