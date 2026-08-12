@@ -38,6 +38,27 @@ let log2 n =
 let is_imm12 n = n >= -2048 && n <= 2047
 
 (* ============================================================ *)
+(* 判断函数是否需要栈帧 *)
+
+(* 展开函数为指令列表 *)
+let flatten_func (f: ir_func) =
+  List.concat_map (fun b -> Label b.label :: b.instrs) (f.entry :: f.blocks)
+
+(* 检查函数是否为叶函数（无函数调用） *)
+let is_leaf_function (f: ir_func) =
+  let instrs = flatten_func f in
+  let has_call = ref false in
+  List.iter (function
+    | Call _ -> has_call := true
+    | _ -> ()
+  ) instrs;
+  not !has_call
+
+(* 检查函数是否有局部变量需要栈槽 *)
+let has_local_storage (f: ir_func) =
+  List.length f.locals > 0 || f.temps > 0
+
+(* ============================================================ *)
 (* 安全的偏移量查找 *)
 
 let find_offset map op =
@@ -128,7 +149,51 @@ let compute_offsets (f: ir_func) =
   (!local_slots, map)
 
 (* ============================================================ *)
-(* 生成乘除法优化的代码 *)
+(* 生成优化的二元运算代码 *)
+
+(* 生成加法代码（含常量优化） *)
+let emit_add x y z map =
+  begin
+    match y, z with
+    | Const 0, nonconst ->
+        load_op "t0" nonconst map
+    | nonconst, Const 0 ->
+        load_op "t0" nonconst map
+    | Const c, nonconst when is_imm12 c ->
+        load_op "t0" nonconst map;
+        Printf.printf "    addi t0, t0, %d\n" c
+    | nonconst, Const c when is_imm12 c ->
+        load_op "t0" nonconst map;
+        Printf.printf "    addi t0, t0, %d\n" c
+    | Const a, Const b ->
+        Printf.printf "    li t0, %d\n" (a + b)
+    | _ ->
+        load_op "t0" y map;
+        load_op "t1" z map;
+        Printf.printf "    add t0, t0, t1\n"
+    end;
+  store_op "t0" x map
+
+(* 生成减法代码（含常量优化） *)
+let emit_sub x y z map =
+  begin
+    match y, z with
+    | nonconst, Const 0 ->
+        load_op "t0" nonconst map
+    | Const 0, nonconst ->
+        load_op "t0" nonconst map;
+        Printf.printf "    neg t0, t0\n"
+    | nonconst, Const c when is_imm12 (-c) ->
+        load_op "t0" nonconst map;
+        Printf.printf "    addi t0, t0, %d\n" (-c)
+    | Const a, Const b ->
+        Printf.printf "    li t0, %d\n" (a - b)
+    | _ ->
+        load_op "t0" y map;
+        load_op "t1" z map;
+        Printf.printf "    sub t0, t0, t1\n"
+    end;
+  store_op "t0" x map
 
 (* 生成乘法代码（使用 M 扩展 + 常量优化） *)
 let emit_mul x y z map =
@@ -218,10 +283,8 @@ let emit_mod x y z map =
     else if is_power_of_two n then
       let mask = n - 1 in
       if is_imm12 mask then
-        (* 小掩码：用 andi（一条指令） *)
         Printf.printf "    andi t0, t0, %d\n" mask
       else
-        (* 大掩码：用 li + and（两条指令） *)
         (Printf.printf "    li t1, %d\n" mask;
          Printf.printf "    and t0, t0, t1\n")
     else
@@ -233,37 +296,179 @@ let emit_mod x y z map =
      Printf.printf "    rem t0, t0, t1\n");
   store_op "t0" x map
 
+(* 生成比较运算代码（含常量优化） *)
+let emit_compare x op y z map =
+  begin
+    match op with
+    | Ast.Eq ->
+        (match y, z with
+         | Const 0, nonconst ->
+             load_op "t0" nonconst map;
+             Printf.printf "    seqz t0, t0\n"
+         | nonconst, Const 0 ->
+             load_op "t0" nonconst map;
+             Printf.printf "    seqz t0, t0\n"
+         | Const a, Const b ->
+             Printf.printf "    li t0, %d\n" (if a = b then 1 else 0)
+         | _ ->
+             load_op "t0" y map;
+             load_op "t1" z map;
+             Printf.printf "    xor t0, t0, t1\n";
+             Printf.printf "    seqz t0, t0\n")
+    | Ast.Ne ->
+        (match y, z with
+         | Const 0, nonconst ->
+             load_op "t0" nonconst map;
+             Printf.printf "    snez t0, t0\n"
+         | nonconst, Const 0 ->
+             load_op "t0" nonconst map;
+             Printf.printf "    snez t0, t0\n"
+         | Const a, Const b ->
+             Printf.printf "    li t0, %d\n" (if a <> b then 1 else 0)
+         | _ ->
+             load_op "t0" y map;
+             load_op "t1" z map;
+             Printf.printf "    xor t0, t0, t1\n";
+             Printf.printf "    snez t0, t0\n")
+    | Ast.Lt ->
+        (match y, z with
+         | Const 0, nonconst ->
+             load_op "t0" nonconst map;
+             Printf.printf "    slti t0, t0, 1\n";
+             Printf.printf "    xori t0, t0, 1\n"
+         | nonconst, Const 0 ->
+             load_op "t0" nonconst map;
+             Printf.printf "    srli t0, t0, 31\n"
+         | nonconst, Const c when is_imm12 c ->
+             load_op "t0" nonconst map;
+             Printf.printf "    slti t0, t0, %d\n" c
+         | Const a, Const b ->
+             Printf.printf "    li t0, %d\n" (if a < b then 1 else 0)
+         | _ ->
+             load_op "t0" y map;
+             load_op "t1" z map;
+             Printf.printf "    slt t0, t0, t1\n")
+    | Ast.Gt ->
+        (match y, z with
+         | nonconst, Const 0 ->
+             load_op "t0" nonconst map;
+             Printf.printf "    slti t0, t0, 1\n";
+             Printf.printf "    xori t0, t0, 1\n"
+         | Const 0, nonconst ->
+             load_op "t0" nonconst map;
+             Printf.printf "    srli t0, t0, 31\n"
+         | Const a, Const b ->
+             Printf.printf "    li t0, %d\n" (if a > b then 1 else 0)
+         | _ ->
+             load_op "t0" y map;
+             load_op "t1" z map;
+             Printf.printf "    slt t0, t1, t0\n")
+    | Ast.Le ->
+        (match y, z with
+         | nonconst, Const 0 ->
+             load_op "t0" nonconst map;
+             Printf.printf "    slti t0, t0, 1\n"
+         | Const 0, nonconst ->
+             load_op "t0" nonconst map;
+             Printf.printf "    srli t0, t0, 31\n";
+             Printf.printf "    xori t0, t0, 1\n"
+         | Const a, Const b ->
+             Printf.printf "    li t0, %d\n" (if a <= b then 1 else 0)
+         | _ ->
+             load_op "t0" y map;
+             load_op "t1" z map;
+             Printf.printf "    slt t0, t1, t0\n";
+             Printf.printf "    xori t0, t0, 1\n")
+    | Ast.Ge ->
+        (match y, z with
+         | nonconst, Const 0 ->
+             load_op "t0" nonconst map;
+             Printf.printf "    srli t0, t0, 31\n";
+             Printf.printf "    xori t0, t0, 1\n"
+         | Const 0, nonconst ->
+             load_op "t0" nonconst map;
+             Printf.printf "    slti t0, t0, 1\n"
+         | Const a, Const b ->
+             Printf.printf "    li t0, %d\n" (if a >= b then 1 else 0)
+         | _ ->
+             load_op "t0" y map;
+             load_op "t1" z map;
+             Printf.printf "    slt t0, t0, t1\n";
+             Printf.printf "    xori t0, t0, 1\n")
+    | _ -> ()
+  end;
+  store_op "t0" x map
+
+(* 生成逻辑运算代码（含常量优化） *)
+let emit_logic x op y z map =
+  begin
+    match op with
+    | Ast.And ->
+        (match y, z with
+         | Const 0, _ ->
+             Printf.printf "    li t0, 0\n"
+         | _, Const 0 ->
+             Printf.printf "    li t0, 0\n"
+         | Const 1, nonconst ->
+             load_op "t0" nonconst map;
+             Printf.printf "    snez t0, t0\n"
+         | nonconst, Const 1 ->
+             load_op "t0" nonconst map;
+             Printf.printf "    snez t0, t0\n"
+         | Const a, Const b ->
+             Printf.printf "    li t0, %d\n" (if a <> 0 && b <> 0 then 1 else 0)
+         | _ ->
+             load_op "t0" y map;
+             load_op "t1" z map;
+             Printf.printf "    and t0, t0, t1\n";
+             Printf.printf "    snez t0, t0\n")
+    | Ast.Or ->
+        (match y, z with
+         | Const 0, nonconst ->
+             load_op "t0" nonconst map;
+             Printf.printf "    snez t0, t0\n"
+         | nonconst, Const 0 ->
+             load_op "t0" nonconst map;
+             Printf.printf "    snez t0, t0\n"
+         | Const 1, _ ->
+             Printf.printf "    li t0, 1\n"
+         | _, Const 1 ->
+             Printf.printf "    li t0, 1\n"
+         | Const a, Const b ->
+             Printf.printf "    li t0, %d\n" (if a <> 0 || b <> 0 then 1 else 0)
+         | _ ->
+             load_op "t0" y map;
+             load_op "t1" z map;
+             Printf.printf "    or t0, t0, t1\n";
+             Printf.printf "    snez t0, t0\n")
+    | _ -> ()
+  end;
+  store_op "t0" x map
+
 (* ============================================================ *)
 (* 翻译单条 TAC 指令 *)
 
 let emit_tac fname tac_inst map current_args =
   match tac_inst with
   | Assign (x, y) ->
-      load_op "t0" y map;
-      store_op "t0" x map
+      (* 如果 x 和 y 是同一个操作数，跳过 *)
+      if x = y then
+        ()
+      else
+        load_op "t0" y map;
+        store_op "t0" x map
 
   | AssignBinOp (x, op, y, z) ->
       (match op with
+       | Ast.Add -> emit_add x y z map
+       | Ast.Sub -> emit_sub x y z map
        | Ast.Mul -> emit_mul x y z map
        | Ast.Div -> emit_div x y z map
        | Ast.Mod -> emit_mod x y z map
-       | _ ->
-           load_op "t0" y map;
-           load_op "t1" z map;
-           (match op with
-            | Ast.Add -> Printf.printf "    add t0, t0, t1\n"
-            | Ast.Sub -> Printf.printf "    sub t0, t0, t1\n"
-            | Ast.Eq  -> Printf.printf "    sub t0, t0, t1\n    sltiu t0, t0, 1\n"
-            | Ast.Ne  -> Printf.printf "    sub t0, t0, t1\n    sltu t0, zero, t0\n"
-            | Ast.Lt  -> Printf.printf "    slt t0, t0, t1\n"
-            | Ast.Gt  -> Printf.printf "    slt t0, t1, t0\n"
-            | Ast.Le  -> Printf.printf "    slt t0, t1, t0\n    xori t0, t0, 1\n"
-            | Ast.Ge  -> Printf.printf "    slt t0, t0, t1\n    xori t0, t0, 1\n"
-            | Ast.And -> Printf.printf "    and t0, t0, t1\n"
-            | Ast.Or  -> Printf.printf "    or t0, t0, t1\n"
-            | Ast.Mul | Ast.Div | Ast.Mod -> assert false
-           );
-           store_op "t0" x map)
+       | Ast.Eq | Ast.Ne | Ast.Lt | Ast.Gt | Ast.Le | Ast.Ge ->
+           emit_compare x op y z map
+       | Ast.And | Ast.Or ->
+           emit_logic x op y z map)
 
   | AssignUnOp (x, op, y) ->
       load_op "t0" y map;
@@ -324,21 +529,16 @@ let emit_tac fname tac_inst map current_args =
 (* ============================================================ *)
 (* 翻译单个基本块 *)
 
-(* 翻译单个基本块 - 遇到跳转指令后停止输出后续指令 *)
-let emit_block fname (b: basic_block) map current_args =
-  if b.label <> "entry" then
-   Printf.printf "%s:\n" b.label;
+let emit_block fname (b: basic_block) map current_args print_label =
+  if print_label && b.label <> "entry" then
+    Printf.printf "%s:\n" b.label;
   let rec emit_until_terminator = function
     | [] -> ()
     | inst :: rest ->
         emit_tac fname inst map current_args;
-        (* 如果是终止指令，停止输出后续指令 *)
         match inst with
-        | Return _ | Goto _ ->
-            (* 后续指令是死代码，不输出 *)
-            ()
-        | _ ->
-            emit_until_terminator rest
+        | Return _ | Goto _ -> ()
+        | _ -> emit_until_terminator rest
   in
   emit_until_terminator b.instrs
 
@@ -347,37 +547,59 @@ let emit_block fname (b: basic_block) map current_args =
 
 let emit_function (f: ir_func) =
   let slots, map = compute_offsets f in
-  let framesize = ((8 + slots * 4 + 15) / 16) * 16 in
+  
+  (* 检查是否不需要栈帧：叶函数且无局部变量且无参数 *)
+  let is_leaf = is_leaf_function f in
+  let has_locals = has_local_storage f in
+  let has_params = List.length f.params > 0 in
+  let needs_frame = (not is_leaf) || has_locals || has_params in
+  
+  let framesize = if needs_frame then ((8 + slots * 4 + 15) / 16) * 16 else 0 in
   
   Printf.printf "    .globl %s\n" f.fname;
   Printf.printf "%s:\n" f.fname;
   
-  Printf.printf "    addi sp, sp, -%d\n" framesize;
-  Printf.printf "    sw ra, %d(sp)\n" (framesize - 4);
-  Printf.printf "    sw fp, %d(sp)\n" (framesize - 8);
-  Printf.printf "    addi fp, sp, %d\n" framesize;
+  (* 只在需要时生成序言 *)
+  if needs_frame then (
+    Printf.printf "    addi sp, sp, -%d\n" framesize;
+    Printf.printf "    sw ra, %d(sp)\n" (framesize - 4);
+    Printf.printf "    sw fp, %d(sp)\n" (framesize - 8);
+    Printf.printf "    addi fp, sp, %d\n" framesize;
+    
+    List.iteri (fun i name ->
+      if i < 8 then
+        let off = Hashtbl.find map (Var name) in
+        Printf.printf "    sw a%d, %d(fp)\n" i off
+    ) f.params
+  );
   
-  List.iteri (fun i name ->
-    if i < 8 then
-      let off = Hashtbl.find map (Var name) in
-      Printf.printf "    sw a%d, %d(fp)\n" i off
-  ) f.params;
+  (* 打印入口标签（如果不是 "entry"） *)
+  if f.entry.label <> "entry" then
+    Printf.printf "%s:\n" f.entry.label;
   
   let current_args = ref [] in
-  emit_block f.fname f.entry map current_args;
-  List.iter (fun b -> emit_block f.fname b map current_args) f.blocks;
+  (* 入口块不打印标签（已在上面处理） *)
+  emit_block f.fname f.entry map current_args false;
+  (* 其他块打印标签 *)
+  List.iter (fun b -> emit_block f.fname b map current_args true) f.blocks;
   
-  Printf.printf ".L_epilogue_%s:\n" f.fname;
-  Printf.printf "    lw ra, -4(fp)\n";
-  Printf.printf "    lw fp, -8(fp)\n";
-  Printf.printf "    addi sp, sp, %d\n" framesize;
-  Printf.printf "    ret\n\n"
+  (* 只在需要时生成结语 *)
+  if needs_frame then (
+    Printf.printf ".L_epilogue_%s:\n" f.fname;
+    Printf.printf "    lw ra, -4(fp)\n";
+    Printf.printf "    lw fp, -8(fp)\n";
+    Printf.printf "    addi sp, sp, %d\n" framesize;
+    Printf.printf "    ret\n"
+  ) else (
+    (* 没有栈帧时，直接返回 *)
+    Printf.printf "    ret\n"
+  )
 
 (* ============================================================ *)
 (* 整个程序的代码生成主入口点 *)
 
 let generate_riscv (prog: ir_program) =
-  Printf.printf "    .text\n\n";
+  Printf.printf "    .text\n";
 
   List.iter (function
     | GlobalVar (name, Some v) ->
@@ -385,13 +607,13 @@ let generate_riscv (prog: ir_program) =
         Printf.printf "    .data\n";
         Printf.printf "    .align 2\n";
         Printf.printf "%s:\n" name;
-        Printf.printf "    .word %d\n\n" v
+        Printf.printf "    .word %d\n" v
     | GlobalVar (name, None) ->
         Printf.printf "    .globl %s\n" name;
         Printf.printf "    .data\n";
         Printf.printf "    .align 2\n";
         Printf.printf "%s:\n" name;
-        Printf.printf "    .space 4\n\n"
+        Printf.printf "    .space 4\n"
     | Function f ->
         Printf.printf "    .text\n";
         emit_function f
