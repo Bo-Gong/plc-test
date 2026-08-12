@@ -1,9 +1,6 @@
-void foo() {
-    int x = 1;
-    int y = x + 2;
-}
-
-int main() {
-    return 1;
-    foo();
+const int a = 0;
+int main()
+{
+    int n = a*2;
+    return n;
 }
