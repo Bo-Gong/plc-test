@@ -448,10 +448,9 @@ let emit_logic x op y z map =
 (* ============================================================ *)
 (* 翻译单条 TAC 指令 *)
 
-let emit_tac fname tac_inst map current_args =
+let emit_tac fname tac_inst map current_args needs_frame =
   match tac_inst with
   | Assign (x, y) ->
-      (* 如果 x 和 y 是同一个操作数，跳过 *)
       if x = y then
         ()
       else
@@ -521,21 +520,27 @@ let emit_tac fname tac_inst map current_args =
 
   | Return (Some x) ->
       load_op "a0" x map;
-      Printf.printf "    j .L_epilogue_%s\n" fname
+      if needs_frame then
+        Printf.printf "    j .L_epilogue_%s\n" fname
+      else
+        Printf.printf "    ret\n"
 
   | Return None ->
-      Printf.printf "    j .L_epilogue_%s\n" fname
+      if needs_frame then
+        Printf.printf "    j .L_epilogue_%s\n" fname
+      else
+        Printf.printf "    ret\n"
 
 (* ============================================================ *)
 (* 翻译单个基本块 *)
 
-let emit_block fname (b: basic_block) map current_args print_label =
+let emit_block fname (b: basic_block) map current_args print_label needs_frame =
   if print_label && b.label <> "entry" then
     Printf.printf "%s:\n" b.label;
   let rec emit_until_terminator = function
     | [] -> ()
     | inst :: rest ->
-        emit_tac fname inst map current_args;
+        emit_tac fname inst map current_args needs_frame;
         match inst with
         | Return _ | Goto _ -> ()
         | _ -> emit_until_terminator rest
@@ -548,7 +553,6 @@ let emit_block fname (b: basic_block) map current_args print_label =
 let emit_function (f: ir_func) =
   let slots, map = compute_offsets f in
   
-  (* 检查是否不需要栈帧：叶函数且无局部变量且无参数 *)
   let is_leaf = is_leaf_function f in
   let has_locals = has_local_storage f in
   let has_params = List.length f.params > 0 in
@@ -559,7 +563,6 @@ let emit_function (f: ir_func) =
   Printf.printf "    .globl %s\n" f.fname;
   Printf.printf "%s:\n" f.fname;
   
-  (* 只在需要时生成序言 *)
   if needs_frame then (
     Printf.printf "    addi sp, sp, -%d\n" framesize;
     Printf.printf "    sw ra, %d(sp)\n" (framesize - 4);
@@ -573,25 +576,18 @@ let emit_function (f: ir_func) =
     ) f.params
   );
   
-  (* 打印入口标签（如果不是 "entry"） *)
   if f.entry.label <> "entry" then
     Printf.printf "%s:\n" f.entry.label;
   
   let current_args = ref [] in
-  (* 入口块不打印标签（已在上面处理） *)
-  emit_block f.fname f.entry map current_args false;
-  (* 其他块打印标签 *)
-  List.iter (fun b -> emit_block f.fname b map current_args true) f.blocks;
+  emit_block f.fname f.entry map current_args false needs_frame;
+  List.iter (fun b -> emit_block f.fname b map current_args true needs_frame) f.blocks;
   
-  (* 只在需要时生成结语 *)
   if needs_frame then (
     Printf.printf ".L_epilogue_%s:\n" f.fname;
     Printf.printf "    lw ra, -4(fp)\n";
     Printf.printf "    lw fp, -8(fp)\n";
     Printf.printf "    addi sp, sp, %d\n" framesize;
-    Printf.printf "    ret\n"
-  ) else (
-    (* 没有栈帧时，直接返回 *)
     Printf.printf "    ret\n"
   )
 
