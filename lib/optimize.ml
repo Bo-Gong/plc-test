@@ -649,7 +649,7 @@ let block_succs (all: basic_block list) : int list list =
                   emit (Call (d, callee, nargs))
               | Return (Some a) ->
                   emit (Return (Some (subst !env a)))
-              | Goto _ | Label _ | Return None ->
+              | Goto _  | Label _ | Return None ->
                   emit inst)
             instrs;
           !env, List.rev !out
