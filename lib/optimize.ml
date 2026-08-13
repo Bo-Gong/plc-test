@@ -1,1226 +1,1179 @@
-(* lib/optimize.ml
- *
+(* lib/optimize.ml *)
+(*
  * 编译器优化通道，作用于 lib/ir.ml 的 TAC 中间表示：
  *
  *   1. 常量折叠（constant folding）
- *      将编译期可知的运算（含基本块内的常量传播、代数化简、
- *      常量条件分支）折叠为直接赋值，减少运行时计算。
- *
  *   2. 尾递归优化（tail recursion optimization）
- *      将 "参数求值 + call 自身 + return 结果" 改写为
- *      "参数槽重赋值 + 跳回函数入口"，把递归调用变成循环，
- *      栈深度保持 O(1)。
- *
  *   3. 死代码消除（dead code elimination）
- *      删除不可达基本块、Goto/Return 之后的不可达指令，
- *      并通过活跃变量分析删除对临时变量/局部变量/参数的
- *      死存储（保留所有调用、分支与全局变量写回）。
+ *   4. 循环不变式外提（loop invariant code motion）
  *)
 
-open Ir
+ open Ir
 
-module S = Set.Make(String)
-module M = Map.Make(String)
+ module S = Set.Make(String)
+ module M = Map.Make(String)
+ module IntSet = Set.Make(struct type t = int let compare = compare end)
+ 
+ (* ---------- 通用工具 ---------- *)
+ 
+ (* 操作数键：Temp -> "T<n>"，Var -> "V<name>"；Const 无键 *)
+ let op_key = function
+   | Const _ -> None
+   | Temp t -> Some ("T" ^ string_of_int t)
+   | Var v -> Some ("V" ^ v)
+ 
+ (* 遍历一条 TAC 指令中的所有操作数 *)
+ let iter_operands f = function
+   | Assign (x, y) -> f x; f y
+   | AssignBinOp (x, _, a, b) -> f x; f a; f b
+   | AssignUnOp (x, _, a) -> f x; f a
+   | IfGoto (a, _) | IfNotGoto (a, _) -> f a
+   | Param a -> f a
+   | Call (x, _, _) -> f x
+   | Return (Some a) -> f a
+   | Goto _ | Label _ | Return None -> ()
+ 
+ (* 统计扁平指令序列中出现的最大 Temp 编号 + 1 *)
+ let count_temps instrs =
+   let m = ref (-1) in
+   List.iter (iter_operands (function
+     | Temp t -> if t > !m then m := t
+     | _ -> ())) instrs;
+   !m + 1
+ 
+ (* 把函数展开为带 Label 的扁平指令序列 *)
+ let flatten_func (f: ir_func) : tac list =
+   List.concat_map (fun b -> Label b.label :: b.instrs) (f.entry :: f.blocks)
+ 
+ (* 重新切分基本块；收缩临时变量编号；剔除不再被引用的局部变量 *)
+ let rebuild_func (f: ir_func) (instrs: tac list) : ir_func =
+   let blocks = match instrs with [] -> [] | _ -> split_blocks instrs in
+   let entry, rest =
+     match blocks with
+     | e :: r -> e, r
+     | [] -> { label = f.entry.label; instrs = [] }, []
+   in
+   let used = ref S.empty in
+   List.iter (iter_operands (function
+     | Var v -> used := S.add v !used
+     | _ -> ())) instrs;
+   let locals =
+     List.filter (fun l -> List.mem l f.params || S.mem l !used) f.locals
+   in
+   { f with entry; blocks = rest; temps = count_temps instrs; locals }
+ 
+ 
 
-(* ---------- 通用工具 ---------- *)
 
-(* 操作数键：Temp -> "T<n>"，Var -> "V<name>"；Const 无键 *)
-let op_key = function
-  | Const _ -> None
-  | Temp t -> Some ("T" ^ string_of_int t)
-  | Var v -> Some ("V" ^ v)
-
-(* 遍历一条 TAC 指令中的所有操作数 *)
-let iter_operands f = function
-  | Assign (x, y) -> f x; f y
-  | AssignBinOp (x, _, a, b) -> f x; f a; f b
-  | AssignUnOp (x, _, a) -> f x; f a
-  | IfGoto (a, _) | IfNotGoto (a, _) -> f a
-  | Param a -> f a
-  | Call (x, _, _) -> f x
-  | Return (Some a) -> f a
-  | Goto _ | Label _ | Return None -> ()
-
-(* 统计扁平指令序列中出现的最大 Temp 编号 + 1，用于收缩栈帧 *)
-let count_temps instrs =
-  let m = ref (-1) in
-  List.iter (iter_operands (function
-    | Temp t -> if t > !m then m := t
-    | _ -> ())) instrs;
-  !m + 1
-
-(* 把函数展开为带 Label 的扁平指令序列（第一个 Label 即入口标签） *)
-let flatten_func (f: ir_func) : tac list =
-  List.concat_map (fun b -> Label b.label :: b.instrs) (f.entry :: f.blocks)
-
-(* 重新切分基本块；收缩临时变量编号；剔除不再被引用的局部变量 *)
-let rebuild_func (f: ir_func) (instrs: tac list) : ir_func =
-  let blocks = match instrs with [] -> [] | _ -> split_blocks instrs in
-  let entry, rest =
-    match blocks with
-    | e :: r -> e, r
-    | [] -> { label = f.entry.label; instrs = [] }, []
-  in
-  let used = ref S.empty in
-  List.iter (iter_operands (function
-    | Var v -> used := S.add v !used
-    | _ -> ())) instrs;
-  let locals =
-    List.filter (fun l -> List.mem l f.params || S.mem l !used) f.locals
-  in
-  { f with entry; blocks = rest; temps = count_temps instrs; locals }
-
-(* ---------- 常量折叠 ---------- *)
-
-(* 将结果折叠到 32 位有符号整数，与 RV32I 运行时行为一致 *)
-let wrap32 n =
-  let m = n land 0xFFFFFFFF in
-  if m >= 0x80000000 then m - 0x100000000 else m
-
-let fold_binop op a b =
-  match op with
-  | Ast.Div | Ast.Mod when b = 0 -> None
-  | _ -> Some (wrap32 (eval_binop op a b))
-
-let fold_unop op a =
-  match op with
-  | Ast.Pos -> Some (wrap32 a)
-  | Ast.Neg -> Some (wrap32 (-a))
-  | Ast.Not -> Some (if a = 0 then 1 else 0)
-
-let is_commutative = Ast.(function
-  | Add | Mul | Eq | Ne | And | Or -> true
-  | Sub | Div | Mod | Lt | Gt | Le | Ge -> false)
-
-let operand_repr = function
-  | Const n -> "C" ^ string_of_int n
-  | Temp t -> "T" ^ string_of_int t
-  | Var v -> "V" ^ v
-
-let binop_repr = Ast.(function
-  | Add -> "+" | Sub -> "-" | Mul -> "*" | Div -> "/" | Mod -> "%"
-  | Eq -> "==" | Ne -> "!=" | Lt -> "<" | Gt -> ">" | Le -> "<=" | Ge -> ">="
-  | And -> "&&" | Or -> "||")
-
-let unop_repr = Ast.(function
-  | Pos -> "+" | Neg -> "-" | Not -> "!")
-
-let expr_key op a b =
-  let ra = operand_repr a and rb = operand_repr b in
-  let x, y =
-    if is_commutative op && String.compare rb ra < 0 then rb, ra else ra, rb
-  in
-  "B" ^ binop_repr op ^ "(" ^ x ^ "," ^ y ^ ")"
-
-let unexpr_key op a =
-  "U" ^ unop_repr op ^ "(" ^ operand_repr a ^ ")"
-
-let depends_on_key k = function
-  | Const _ -> false
-  | (Temp _ | Var _) as o -> op_key o = Some k
-
-let operand_is_local = function
-  | Temp _ -> true
-  | Var v -> String.contains v '$'
-  | Const _ -> false
-
-let subst_copy env o =
-  let rec go seen o =
-    match op_key o with
-    | None -> o
-    | Some k when List.mem k seen -> o
-    | Some k ->
-        (match List.assoc_opt k env with
-         | Some o' -> go (k :: seen) o'
-         | None -> o)
-  in
-  go [] o
-
-let invalidate_copy d env =
-  match op_key d with
-  | None -> env
-  | Some k ->
-      List.filter
-        (fun (dst, src) -> dst <> k && not (depends_on_key k src))
-        env
-
-(* Copy propagation within each basic block.  This mostly targets p03-style
-   chains such as a=b; c=a; return c, and it deliberately forgets facts at
-   labels and calls. *)
-let copy_prop (instrs: tac list) : tac list =
-  let env = ref [] in
-  let set d s =
-    match op_key d with
-    | Some k when d <> s -> env := (k, s) :: List.remove_assoc k !env
-    | _ -> ()
-  in
-  let kill d = env := invalidate_copy d !env in
-  let clear () = env := [] in
-  let out = ref [] in
-  let emit i = out := i :: !out in
-  List.iter (fun i ->
-    match i with
-    | Assign (d, s) ->
-        let s' = subst_copy !env s in
-        kill d;
-        if d <> s' then (
-          emit (Assign (d, s'));
-          set d s')
-    | AssignBinOp (d, op, a, b) ->
-        let a' = subst_copy !env a and b' = subst_copy !env b in
-        kill d;
-        emit (AssignBinOp (d, op, a', b'))
-    | AssignUnOp (d, op, a) ->
-        let a' = subst_copy !env a in
-        kill d;
-        emit (AssignUnOp (d, op, a'))
-    | IfGoto (a, l) -> emit (IfGoto (subst_copy !env a, l))
-    | IfNotGoto (a, l) -> emit (IfNotGoto (subst_copy !env a, l))
-    | Param a -> emit (Param (subst_copy !env a))
-    | Call (d, fname, n) ->
-        emit (Call (d, fname, n));
-        (* 函数调用可能改写全局变量：除了丢弃以全局变量为目的地的拷贝事实外，
-           还要丢弃以全局变量为源的事实（如 T0 = g），否则调用后使用 T0
-           会被替换成重新读 g，读到被修改后的值。带 $ 的局部变量/参数
-           不会被被调函数修改，可以保留。 *)
-        env :=
-          List.filter
-            (fun (k, src) ->
-              (String.length k = 0 || k.[0] <> 'V')
-              && match src with
-                 | Var v -> String.contains v '$'
-                 | Const _ | Temp _ -> true)
-            !env;
-        kill d
-    | Return (Some a) -> emit (Return (Some (subst_copy !env a)))
-    | Label l -> emit (Label l); clear ()
-    | Goto l -> emit (Goto l)
-    | Return None -> emit (Return None)
-  ) instrs;
-  List.rev !out
-
-type available_expr = {
-  ekey: string;
-  result: operand;
-  deps: operand list;
-}
-
-let invalidate_exprs d env =
-  match op_key d with
-  | None -> env
-  | Some k ->
-      List.filter
-        (fun e ->
-          op_key e.result <> Some k
-          && not (List.exists (depends_on_key k) e.deps))
-        env
-
-let find_expr k env =
-  match List.find_opt (fun e -> e.ekey = k) env with
-  | Some e -> Some e.result
-  | None -> None
-
-let record_expr k d deps env =
-  if operand_is_local d then { ekey = k; result = d; deps } :: List.filter (fun e -> e.ekey <> k) env
-  else env
-
-(* Local common subexpression elimination.  It catches repeated pure TAC
-   expressions inside a basic block, for example a*b computed twice before
-   either a or b changes. *)
-let common_subexpr (instrs: tac list) : tac list =
-  let env = ref [] in
-  let out = ref [] in
-  let emit i = out := i :: !out in
-  let clear () = env := [] in
-  List.iter (fun i ->
-    match i with
-    | Assign (d, s) ->
-        env := invalidate_exprs d !env;
-        if d <> s then emit i
-    | AssignBinOp (d, op, a, b) ->
-        env := invalidate_exprs d !env;
-        let k = expr_key op a b in
-        (match find_expr k !env with
-         | Some prev -> emit (Assign (d, prev))
-         | None ->
-             emit i;
-             env := record_expr k d [a; b] !env)
-    | AssignUnOp (d, op, a) ->
-        env := invalidate_exprs d !env;
-        let k = unexpr_key op a in
-        (match find_expr k !env with
-         | Some prev -> emit (Assign (d, prev))
-         | None ->
-             emit i;
-             env := record_expr k d [a] !env)
-    | Call (d, fname, n) ->
-        emit (Call (d, fname, n));
-        clear ();
-        env := invalidate_exprs d !env
-    | Label l -> emit (Label l); clear ()
-    | _ -> emit i
-  ) instrs;
-  List.rev !out
-
-let def_operand = function
-  | Assign (d, _) | AssignBinOp (d, _, _, _) | AssignUnOp (d, _, _)
-  | Call (d, _, _) -> Some d
-  | _ -> None
-
-let substitute_operands subst = function
-  | Assign (d, s) -> Assign (d, subst s)
-  | AssignBinOp (d, op, a, b) -> AssignBinOp (d, op, subst a, subst b)
-  | AssignUnOp (d, op, a) -> AssignUnOp (d, op, subst a)
-  | IfGoto (a, l) -> IfGoto (subst a, l)
-  | IfNotGoto (a, l) -> IfNotGoto (subst a, l)
-  | Param a -> Param (subst a)
-  | Return (Some a) -> Return (Some (subst a))
-  | i -> i
-
-(* Constants assigned exactly once are safe to substitute across labels.  This
-   covers loop bounds such as int n = 100; while (i < n) ... without needing
-   full data-flow analysis.
-
-   仅对 Temp 和非参数的局部变量传播：
-   - 全局变量的"仅一次常量赋值"可能出现在条件分支里，或某次读发生在赋值
-     之前，直接替换会改变语义（读到的是初值）。
-   - 参数的初值来自调用方（IR 中没有对应的 Assign），若函数体内对参数做
-     一次常量赋值，赋值之前的读不能被替换成该常量。 *)
-let single_assign_const_prop (params: string list) (instrs: tac list) : tac list =
-  let defs = Hashtbl.create 32 in
-  let const_defs = Hashtbl.create 32 in
-  let bump k =
-    let old = match Hashtbl.find_opt defs k with Some n -> n | None -> 0 in
-    Hashtbl.replace defs k (old + 1)
-  in
-  List.iter (fun i ->
-    match def_operand i with
-    | Some d ->
-        (match op_key d with
-         | Some k ->
-             bump k;
-             (match i with
-              | Assign (_, Const n) -> Hashtbl.replace const_defs k n
-              | _ -> Hashtbl.remove const_defs k)
-         | None -> ())
-    | None -> ())
-    instrs;
-  let is_param = function Var v -> List.mem v params | _ -> false in
-  let subst = function
-    | (Temp _ | Var _) as o when operand_is_local o && not (is_param o) ->
-        (match op_key o with
-         | Some k when Hashtbl.find_opt defs k = Some 1 ->
-             (match Hashtbl.find_opt const_defs k with
-              | Some n -> Const n
-              | None -> o)
-         | _ -> o)
-    | o -> o
-  in
-  List.map (substitute_operands subst) instrs
-
-(* 常量折叠 + 基本块内常量传播 + 代数化简。
- * 每个 Label 处清空已知值（块间不做跨路径传播，保证安全）。 *)
-let const_fold (instrs: tac list) : tac list =
-  let env = ref [] in
-  let find k = List.assoc_opt k !env in
-  let set k v = env := (k, v) :: List.remove_assoc k !env in
-  let drop k = env := List.remove_assoc k !env in
-  let clear () = env := [] in
-  let subst o =
-    match op_key o with
-    | Some k -> (match find k with Some n -> Const n | None -> o)
-    | None -> o
-  in
-  let record_def d v =
-    match op_key d with Some k -> set k v | None -> ()
-  in
-  let invalidate d =
-    match op_key d with Some k -> drop k | None -> ()
-  in
-  let out = ref [] in
-  let emit i = out := i :: !out in
-  List.iter (fun i ->
-    match i with
-    | Assign (d, s) when d = s -> ()  (* 自赋值无意义 *)
-    | Assign (d, s) ->
-        let s' = subst s in
-        (match s' with
-         | Const n -> emit (Assign (d, Const n)); record_def d n
-         | _ -> emit (Assign (d, s')); invalidate d)
-    | AssignBinOp (d, op, a, b) ->
-        let a' = subst a and b' = subst b in
-        (match a', b' with
-         | Const x, Const y ->
-             (match fold_binop op x y with
-              | Some v -> emit (Assign (d, Const v)); record_def d v
-              | None -> emit (AssignBinOp (d, op, a', b')); invalidate d)
-         | _ ->
-             let simplified =
-               match op, a', b' with
-               | Ast.Add, x, Const 0 | Ast.Add, Const 0, x -> Some x
-               | Ast.Sub, x, Const 0 -> Some x
-               | Ast.Sub, x, y when x = y -> Some (Const 0)
-               | Ast.Mul, Const 0, _ | Ast.Mul, _, Const 0 -> Some (Const 0)
-               | Ast.Mul, Const 1, x | Ast.Mul, x, Const 1 -> Some x
-               | Ast.Div, x, Const 1 -> Some x
-               | Ast.Mod, _, Const 1 -> Some (Const 0)
-               | Ast.Eq, x, y when x = y -> Some (Const 1)
-               | Ast.Ne, x, y when x = y -> Some (Const 0)
-               | Ast.Lt, x, y when x = y -> Some (Const 0)
-               | Ast.Gt, x, y when x = y -> Some (Const 0)
-               | Ast.Le, x, y when x = y -> Some (Const 1)
-               | Ast.Ge, x, y when x = y -> Some (Const 1)
-               | _ -> None
-             in
-             (match simplified with
-              | Some s -> emit (Assign (d, s)); invalidate d
-              | None -> emit (AssignBinOp (d, op, a', b')); invalidate d))
-    | AssignUnOp (d, op, a) ->
-        let a' = subst a in
-        (match a' with
-         | Const n ->
-             (match fold_unop op n with
-              | Some v -> emit (Assign (d, Const v)); record_def d v
-              | None -> emit (AssignUnOp (d, op, a')); invalidate d)
-         | _ -> emit (AssignUnOp (d, op, a')); invalidate d)
-    | IfGoto (a, l) ->
-        let a' = subst a in
-        (match a' with
-         | Const n -> if n <> 0 then emit (Goto l)
-         | _ -> emit (IfGoto (a', l)))
-    | IfNotGoto (a, l) ->
-        let a' = subst a in
-        (match a' with
-         | Const n -> if n = 0 then emit (Goto l)
-         | _ -> emit (IfNotGoto (a', l)))
-    | Param a -> emit (Param (subst a))
-    | Call (d, fname, n) ->
-        emit (Call (d, fname, n));
-        (* 函数调用可能修改全局变量，作废所有 Var 的已知值 *)
-        env := List.filter (fun (k, _) -> String.length k = 0 || k.[0] <> 'V') !env;
-        invalidate d
-    | Return (Some a) -> emit (Return (Some (subst a)))
-    | Goto l -> emit (Goto l)
-    | Label l -> emit (Label l); clear ()
-    | Return None -> emit (Return None)
-  ) instrs;
-  List.rev !out
-
-(* Extra algebraic simplification that can rewrite one TAC instruction into
-   another operation, not just into a single operand. *)
-let algebra_simplify (instrs: tac list) : tac list =
-  List.map (function
-    | AssignBinOp (d, Ast.Mul, x, Const 2)
-    | AssignBinOp (d, Ast.Mul, Const 2, x) ->
-        AssignBinOp (d, Ast.Add, x, x)
-    | AssignBinOp (d, Ast.Mul, x, Const (-1))
-    | AssignBinOp (d, Ast.Mul, Const (-1), x) ->
-        AssignUnOp (d, Ast.Neg, x)
-    | AssignBinOp (d, Ast.Div, Const 0, _) ->
-        Assign (d, Const 0)
-    | AssignBinOp (d, Ast.Mod, Const 0, _) ->
-        Assign (d, Const 0)
-    | AssignBinOp (d, Ast.And, Const 0, _)
-    | AssignBinOp (d, Ast.And, _, Const 0) ->
-        Assign (d, Const 0)
-    | AssignBinOp (d, Ast.And, Const n, x) when n <> 0 ->
-        Assign (d, x)
-    | AssignBinOp (d, Ast.And, x, Const n) when n <> 0 ->
-        Assign (d, x)
-    | AssignBinOp (d, Ast.Or, Const n, _) when n <> 0 ->
-        Assign (d, Const 1)
-    | AssignBinOp (d, Ast.Or, _, Const n) when n <> 0 ->
-        Assign (d, Const 1)
-    | AssignBinOp (d, Ast.Or, Const 0, x)
-    | AssignBinOp (d, Ast.Or, x, Const 0) ->
-        Assign (d, x)
-    | i -> i
-  ) instrs
-
-(* ---------- 尾递归优化 ---------- *)
-
-(* 将 "Param*; Call f; Return t"（f 为当前函数）改写为参数重赋值 + 跳回入口。
- *
- * 注意：IR 流序中的 Params 与 codegen 实际装载顺序相反
- * （codegen 用 prepend 累积，再按 a0..a7 顺序消费），因此
- * 参数映射需要把流序 Params 反转后对应到形参表。
- *)
-let tail_recursion (f: ir_func) (instrs: tac list) : tac list =
-  let fname = f.fname in
-  let params = f.params in
-  let nparams = List.length params in
-  let entry_label = f.entry.label in
-  let is_param o = match o with Var v -> List.mem v params | _ -> false in
-  let tmp = ref (count_temps instrs) in
-  let fresh () = let t = !tmp in incr tmp; Temp t in
-  let rec loop acc = function
-    | [] -> List.rev acc
-    | (Param o :: rest) as instrs when nparams > 0 ->
-        let rec collect k acc_ps = function
-          | (Param p) :: r when k > 0 -> collect (k - 1) (p :: acc_ps) r
-          | r -> List.rev acc_ps, r
-        in
-        let ps, after = collect nparams [] instrs in
-        (match after with
-         | Call (d, callee, n) :: Return (Some d') :: rest'
-           when callee = fname && n = nparams
-             && List.length ps = nparams && d = d' ->
-             (* 参数槽可能被参数表达式读取，先复制到临时变量再写回 *)
-             let args = List.rev ps in
-             let copies =
-               List.map (fun a -> if is_param a then Some (fresh ()) else None) args
-             in
-             let pre =
-               List.concat
-                 (List.map2 (fun a c ->
-                    match c with Some t -> [Assign (t, a)] | None -> [])
-                    args copies)
-             in
-             let assigns =
-               List.map2 (fun p (c, a) ->
-                 Assign (Var p, match c with Some t -> t | None -> a))
-                 params (List.combine copies args)
-             in
-             loop (List.rev_append (pre @ assigns @ [Goto entry_label]) acc) rest'
-         | _ -> loop (Param o :: acc) rest)
-    | Call (d, callee, 0) :: Return (Some d') :: rest
-      when callee = fname && nparams = 0 && d = d' ->
-        loop (Goto entry_label :: acc) rest
-    | i :: rest -> loop (i :: acc) rest
-  in
-  loop [] instrs
-
-(* ---------- 死代码消除 ---------- *)
-
-(* 确保入口标签是全局唯一、可被汇编打印的标签
-   （避免多个函数共用 fallback 名 "entry" 造成重复标签） *)
-let normalize_entry (f: ir_func) (instrs: tac list) : ir_func * tac list =
-  if f.entry.label <> "entry" then f, instrs
-  else
-    let l = fresh_label () in
-    let instrs =
-      match instrs with
-      | Label _ :: rest -> Label l :: rest
-      | _ -> Label l :: instrs
-    in
-    { f with entry = { f.entry with label = l } }, instrs
-
-(* 截断基本块：Goto/Return 之后的指令不可达，直接删除 *)
-let truncate_block (b: basic_block) : basic_block =
-  let rec go acc = function
-    | [] -> List.rev acc
-    | ((Goto _ | Return _) as i) :: _ -> List.rev (i :: acc)
-    | i :: rest -> go (i :: acc) rest
-  in
-  { b with instrs = go [] b.instrs }
-
-let truncate_func (f: ir_func) : ir_func =
-  { f with
-    entry = truncate_block f.entry;
-    blocks = List.map truncate_block f.blocks }
-
-(* 每个基本块的后继块下标列表 *)
-let block_succs (all: basic_block list) : int list list =
-  let n = List.length all in
-  let idx = Hashtbl.create 16 in
-  List.iteri (fun i b -> Hashtbl.replace idx b.label i) all;
-  let target l =
-    match Hashtbl.find_opt idx l with Some j -> [j] | None -> []
-  in
-  List.mapi (fun i (b: basic_block) ->
-    let next = if i + 1 < n then [i + 1] else [] in
-    (* 块内所有分支/跳转的目标（Goto、IfGoto、IfNotGoto）都是后继 *)
-    let targets = ref [] in
-    List.iter (function
-      | Goto l | IfGoto (_, l) | IfNotGoto (_, l) -> targets := l :: !targets
-      | _ -> ()) b.instrs;
-    let ts =
-      List.concat_map target (List.rev !targets)
-    in
-    (* 仅当块以无条件跳转或返回结束时才没有顺延后继 *)
-    let terminated =
-      match List.rev b.instrs with
-      | (Goto _ | Return _) :: _ -> true
-      | _ -> false
-    in
-    if terminated then ts else ts @ next) all
-
-    let const_prop_cfg (f: ir_func) : ir_func =
-      let all = f.entry :: f.blocks in
-      let n = List.length all in
-      if n = 0 then f
-      else
-        let succs = Array.of_list (block_succs all) in
-        let preds = Array.make n [] in
-        Array.iteri
-          (fun i js ->
-            List.iter
-              (fun j ->
-                if j >= 0 && j < n then preds.(j) <- i :: preds.(j))
-              js)
-          succs;
-        let tracked = function
-          | Temp _ -> true
-          | Var v -> List.mem v f.params || List.mem v f.locals
-          | Const _ -> false
-        in
-        let env_find o env =
-          match op_key o with
-          | Some k -> M.find_opt k env
-          | None -> None
-        in
-        let subst env = function
-          | Const _ as c -> c
-          | (Temp _ | Var _) as o ->
-              (match env_find o env with Some n -> Const n | None -> o)
-        in
-        let env_set d v env =
-          match op_key d with
-          | Some k when tracked d -> M.add k v env
-          | _ -> env
-        in
-        let env_drop d env =
-          match op_key d with
-          | Some k when tracked d -> M.remove k env
-          | _ -> env
-        in
-        let meet envs =
-          match envs with
-          | [] -> M.empty
-          | first :: rest ->
-              M.filter
-                (fun k v -> List.for_all (fun e -> M.find_opt k e = Some v) rest)
-                first
-        in
-        let transfer env instrs =
-          let env = ref env in
-          let out = ref [] in
-          let emit i = out := i :: !out in
-          let def_const d v =
-            env := env_set d v !env;
-            emit (Assign (d, Const v))
-          in
-          List.iter
-            (fun inst ->
-              match inst with
-              | Assign (d, s) ->
-                  let s' = subst !env s in
-                  (match s' with
-                   | Const n -> def_const d n
-                   | _ ->
-                       env := env_drop d !env;
-                       if d <> s' then emit (Assign (d, s')))
-              | AssignBinOp (d, op, a, b) ->
-                  let a' = subst !env a and b' = subst !env b in
-                  (match a', b' with
-                   | Const x, Const y ->
-                       (match fold_binop op x y with
-                        | Some v -> def_const d v
-                        | None ->
-                            env := env_drop d !env;
-                            emit (AssignBinOp (d, op, a', b')))
-                   | _ ->
-                       env := env_drop d !env;
-                       emit (AssignBinOp (d, op, a', b')))
-              | AssignUnOp (d, op, a) ->
-                  let a' = subst !env a in
-                  (match a' with
-                   | Const x ->
-                       (match fold_unop op x with
-                        | Some v -> def_const d v
-                        | None ->
-                            env := env_drop d !env;
-                            emit (AssignUnOp (d, op, a')))
-                   | _ ->
-                       env := env_drop d !env;
-                       emit (AssignUnOp (d, op, a')))
-              | IfGoto (a, l) ->
-                  (match subst !env a with
-                   | Const n -> if n <> 0 then emit (Goto l)
-                   | a' -> emit (IfGoto (a', l)))
-              | IfNotGoto (a, l) ->
-                  (match subst !env a with
-                   | Const n -> if n = 0 then emit (Goto l)
-                   | a' -> emit (IfNotGoto (a', l)))
-              | Param a ->
-                  emit (Param (subst !env a))
-              | Call (d, callee, nargs) ->
-                  env := env_drop d !env;
-                  emit (Call (d, callee, nargs))
-              | Return (Some a) ->
-                  emit (Return (Some (subst !env a)))
-              | Goto _  | Label _ | Return None ->
-                  emit inst)
-            instrs;
-          !env, List.rev !out
-        in
-        let in_env = Array.make n M.empty in
-        let out_env = Array.make n M.empty in
-        let changed = ref true in
-        while !changed do
-          changed := false;
-          for i = 0 to n - 1 do
-            let input =
-              if i = 0 then M.empty
-              else meet (List.map (fun p -> out_env.(p)) preds.(i))
-            in
-            if not (M.equal (=) input in_env.(i)) then (
-              in_env.(i) <- input;
-              changed := true);
-            let output, _ = transfer input (List.nth all i).instrs in
-            if not (M.equal (=) output out_env.(i)) then (
-              out_env.(i) <- output;
-              changed := true)
-          done
-        done;
-        let rewritten =
-          List.mapi
-            (fun i (b: basic_block) ->
-              let _, instrs = transfer in_env.(i) b.instrs in
-              { b with instrs })
-            all
-        in
-        match rewritten with
-        | entry :: blocks -> { f with entry; blocks }
-        | [] -> f
-(* 删除从入口不可达的基本块 *)
-let remove_unreachable_blocks (f: ir_func) : ir_func =
-  let all = f.entry :: f.blocks in
-  let succs = Array.of_list (block_succs all) in
-  let n = List.length all in
-  let reachable = Array.make n false in
-  let queue = Queue.create () in
-  reachable.(0) <- true;
-  Queue.push 0 queue;
-  while not (Queue.is_empty queue) do
-    let i = Queue.pop queue in
-    List.iter (fun j ->
-      if j >= 0 && j < n && not reachable.(j) then (
-        reachable.(j) <- true;
-        Queue.push j queue))
-      succs.(i)
-  done;
-  let kept =
-    List.filteri (fun i _ -> reachable.(i)) all
-  in
-  match kept with
-  | e :: r -> { f with entry = e; blocks = r }
-  | [] -> { f with entry = { label = f.entry.label; instrs = [] }; blocks = [] }
-
-(* 活跃变量分析驱动的死存储消除。
- * 只删除对临时变量、局部变量、参数的死存储；
- * 调用、分支、返回以及全局变量写回一律保留。 *)
-let dce (f: ir_func) : ir_func =
-  let all = f.entry :: f.blocks in
-  let succs = Array.of_list (block_succs all) in
-  let n = List.length all in
-  let killable_names =
-    List.fold_left (fun s v -> S.add v s) S.empty (f.params @ f.locals)
-  in
-  let killable = function
-    | Temp _ -> true
-    | Var v -> S.mem v killable_names
-    | Const _ -> false
-  in
-  let add_use o s = match op_key o with Some k -> S.add k s | None -> s in
-  let kill_def o s =
-    match op_key o with
-    | Some k when killable o -> S.remove k s
-    | _ -> s
-  in
-  let uses_of = function
-    | Assign (_, y) -> [y]
-    | AssignBinOp (_, _, a, b) -> [a; b]
-    | AssignUnOp (_, _, a) -> [a]
-    | IfGoto (a, _) | IfNotGoto (a, _) -> [a]
-    | Param a -> [a]
-    | Return (Some a) -> [a]
-    | _ -> []
-  in
-  let def_of = function
-    | Assign (x, _) | AssignBinOp (x, _, _, _) | AssignUnOp (x, _, _)
-    | Call (x, _, _) -> Some x
-    | _ -> None
-  in
-  let use_arr =
-    Array.of_list
-      (List.map (fun (b: basic_block) ->
-         List.fold_left (fun s i ->
-           List.fold_left (fun s o -> add_use o s) s (uses_of i))
-           S.empty b.instrs) all)
-  in
-  let kill_arr =
-    Array.of_list
-      (List.map (fun (b: basic_block) ->
-         List.fold_left (fun s i ->
-           match def_of i with
-           | Some d -> kill_def d s
-           | None -> s) S.empty b.instrs) all)
-  in
-  let live_in = Array.make n S.empty in
-  let live_out = Array.make n S.empty in
-  let changed = ref true in
-  while !changed do
-    changed := false;
-    for i = n - 1 downto 0 do
-      let li = S.union use_arr.(i) (S.diff live_out.(i) kill_arr.(i)) in
-      if not (S.equal li live_in.(i)) then (live_in.(i) <- li; changed := true);
-      let lo =
-        List.fold_left (fun s j -> S.union s live_in.(j)) S.empty succs.(i)
-      in
-      if not (S.equal lo live_out.(i)) then (live_out.(i) <- lo; changed := true)
-    done
-  done;
-  let rewrite (b: basic_block) i =
-    let live = ref live_out.(i) in
-    let instrs =
-      List.fold_right (fun inst acc ->
-        let keep, live' =
-          match inst with
-          | Assign (d, s) when d = s -> false, !live
-          | Assign (d, s) ->
-              let dead =
-                match op_key d with
-                | Some k when killable d -> not (S.mem k !live)
-                | _ -> false
+ 
+ (* ---------- 常量折叠 ---------- *)
+ 
+ (* 将结果折叠到 32 位有符号整数 *)
+ let wrap32 n =
+   let m = n land 0xFFFFFFFF in
+   if m >= 0x80000000 then m - 0x100000000 else m
+ 
+ let fold_binop op a b =
+   match op with
+   | Ast.Div | Ast.Mod when b = 0 -> None
+   | _ -> Some (wrap32 (eval_binop op a b))
+ 
+ let fold_unop op a =
+   match op with
+   | Ast.Pos -> Some (wrap32 a)
+   | Ast.Neg -> Some (wrap32 (-a))
+   | Ast.Not -> Some (if a = 0 then 1 else 0)
+ 
+ let is_commutative = Ast.(function
+   | Add | Mul | Eq | Ne | And | Or -> true
+   | Sub | Div | Mod | Lt | Gt | Le | Ge -> false)
+ 
+ let operand_repr = function
+   | Const n -> "C" ^ string_of_int n
+   | Temp t -> "T" ^ string_of_int t
+   | Var v -> "V" ^ v
+ 
+ let binop_repr = Ast.(function
+   | Add -> "+" | Sub -> "-" | Mul -> "*" | Div -> "/" | Mod -> "%"
+   | Eq -> "==" | Ne -> "!=" | Lt -> "<" | Gt -> ">" | Le -> "<=" | Ge -> ">="
+   | And -> "&&" | Or -> "||")
+ 
+ let unop_repr = Ast.(function
+   | Pos -> "+" | Neg -> "-" | Not -> "!")
+ 
+ let expr_key op a b =
+   let ra = operand_repr a and rb = operand_repr b in
+   let x, y =
+     if is_commutative op && String.compare rb ra < 0 then rb, ra else ra, rb
+   in
+   "B" ^ binop_repr op ^ "(" ^ x ^ "," ^ y ^ ")"
+ 
+ let unexpr_key op a =
+   "U" ^ unop_repr op ^ "(" ^ operand_repr a ^ ")"
+ 
+ let depends_on_key k = function
+   | Const _ -> false
+   | (Temp _ | Var _) as o -> op_key o = Some k
+ 
+ let operand_is_local = function
+   | Temp _ -> true
+   | Var v -> String.contains v '$'
+   | Const _ -> false
+ 
+ let subst_copy env o =
+   let rec go seen o =
+     match op_key o with
+     | None -> o
+     | Some k when List.mem k seen -> o
+     | Some k ->
+         (match List.assoc_opt k env with
+          | Some o' -> go (k :: seen) o'
+          | None -> o)
+   in
+   go [] o
+ 
+ let invalidate_copy d env =
+   match op_key d with
+   | None -> env
+   | Some k ->
+       List.filter
+         (fun (dst, src) -> dst <> k && not (depends_on_key k src))
+         env
+ 
+ let copy_prop (instrs: tac list) : tac list =
+   let env = ref [] in
+   let set d s =
+     match op_key d with
+     | Some k when d <> s -> env := (k, s) :: List.remove_assoc k !env
+     | _ -> ()
+   in
+   let kill d = env := invalidate_copy d !env in
+   let clear () = env := [] in
+   let out = ref [] in
+   let emit i = out := i :: !out in
+   List.iter (fun i ->
+     match i with
+     | Assign (d, s) ->
+         let s' = subst_copy !env s in
+         kill d;
+         if d <> s' then (
+           emit (Assign (d, s'));
+           set d s')
+     | AssignBinOp (d, op, a, b) ->
+         let a' = subst_copy !env a and b' = subst_copy !env b in
+         kill d;
+         emit (AssignBinOp (d, op, a', b'))
+     | AssignUnOp (d, op, a) ->
+         let a' = subst_copy !env a in
+         kill d;
+         emit (AssignUnOp (d, op, a'))
+     | IfGoto (a, l) -> emit (IfGoto (subst_copy !env a, l))
+     | IfNotGoto (a, l) -> emit (IfNotGoto (subst_copy !env a, l))
+     | Param a -> emit (Param (subst_copy !env a))
+     | Call (d, fname, n) ->
+         emit (Call (d, fname, n));
+         env :=
+           List.filter
+             (fun (k, src) ->
+               (String.length k = 0 || k.[0] <> 'V')
+               && match src with
+                  | Var v -> String.contains v '$'
+                  | Const _ | Temp _ -> true)
+             !env;
+         kill d
+     | Return (Some a) -> emit (Return (Some (subst_copy !env a)))
+     | Label l -> emit (Label l); clear ()
+     | Goto l -> emit (Goto l)
+     | Return None -> emit (Return None)
+   ) instrs;
+   List.rev !out
+ 
+ type available_expr = {
+   ekey: string;
+   result: operand;
+   deps: operand list;
+ }
+ 
+ let invalidate_exprs d env =
+   match op_key d with
+   | None -> env
+   | Some k ->
+       List.filter
+         (fun e ->
+           op_key e.result <> Some k
+           && not (List.exists (depends_on_key k) e.deps))
+         env
+ 
+ let find_expr k env =
+   match List.find_opt (fun e -> e.ekey = k) env with
+   | Some e -> Some e.result
+   | None -> None
+ 
+ let record_expr k d deps env =
+   if operand_is_local d then { ekey = k; result = d; deps } :: List.filter (fun e -> e.ekey <> k) env
+   else env
+ 
+ let common_subexpr (instrs: tac list) : tac list =
+   let env = ref [] in
+   let out = ref [] in
+   let emit i = out := i :: !out in
+   let clear () = env := [] in
+   List.iter (fun i ->
+     match i with
+     | Assign (d, s) ->
+         env := invalidate_exprs d !env;
+         if d <> s then emit i
+     | AssignBinOp (d, op, a, b) ->
+         env := invalidate_exprs d !env;
+         let k = expr_key op a b in
+         (match find_expr k !env with
+          | Some prev -> emit (Assign (d, prev))
+          | None ->
+              emit i;
+              env := record_expr k d [a; b] !env)
+     | AssignUnOp (d, op, a) ->
+         env := invalidate_exprs d !env;
+         let k = unexpr_key op a in
+         (match find_expr k !env with
+          | Some prev -> emit (Assign (d, prev))
+          | None ->
+              emit i;
+              env := record_expr k d [a] !env)
+     | Call (d, fname, n) ->
+         emit (Call (d, fname, n));
+         clear ();
+         env := invalidate_exprs d !env
+     | Label l -> emit (Label l); clear ()
+     | _ -> emit i
+   ) instrs;
+   List.rev !out
+ 
+ let def_operand = function
+   | Assign (d, _) | AssignBinOp (d, _, _, _) | AssignUnOp (d, _, _)
+   | Call (d, _, _) -> Some d
+   | _ -> None
+ 
+ let substitute_operands subst = function
+   | Assign (d, s) -> Assign (d, subst s)
+   | AssignBinOp (d, op, a, b) -> AssignBinOp (d, op, subst a, subst b)
+   | AssignUnOp (d, op, a) -> AssignUnOp (d, op, subst a)
+   | IfGoto (a, l) -> IfGoto (subst a, l)
+   | IfNotGoto (a, l) -> IfNotGoto (subst a, l)
+   | Param a -> Param (subst a)
+   | Return (Some a) -> Return (Some (subst a))
+   | i -> i
+ 
+ let single_assign_const_prop (params: string list) (instrs: tac list) : tac list =
+   let defs = Hashtbl.create 32 in
+   let const_defs = Hashtbl.create 32 in
+   let bump k =
+     let old = match Hashtbl.find_opt defs k with Some n -> n | None -> 0 in
+     Hashtbl.replace defs k (old + 1)
+   in
+   List.iter (fun i ->
+     match def_operand i with
+     | Some d ->
+         (match op_key d with
+          | Some k ->
+              bump k;
+              (match i with
+               | Assign (_, Const n) -> Hashtbl.replace const_defs k n
+               | _ -> Hashtbl.remove const_defs k)
+          | None -> ())
+     | None -> ())
+     instrs;
+   let is_param = function Var v -> List.mem v params | _ -> false in
+   let subst = function
+     | (Temp _ | Var _) as o when operand_is_local o && not (is_param o) ->
+         (match op_key o with
+          | Some k when Hashtbl.find_opt defs k = Some 1 ->
+              (match Hashtbl.find_opt const_defs k with
+               | Some n -> Const n
+               | None -> o)
+          | _ -> o)
+     | o -> o
+   in
+   List.map (substitute_operands subst) instrs
+ 
+ let const_fold (instrs: tac list) : tac list =
+   let env = ref [] in
+   let find k = List.assoc_opt k !env in
+   let set k v = env := (k, v) :: List.remove_assoc k !env in
+   let drop k = env := List.remove_assoc k !env in
+   let clear () = env := [] in
+   let subst o =
+     match op_key o with
+     | Some k -> (match find k with Some n -> Const n | None -> o)
+     | None -> o
+   in
+   let record_def d v =
+     match op_key d with Some k -> set k v | None -> ()
+   in
+   let invalidate d =
+     match op_key d with Some k -> drop k | None -> ()
+   in
+   let out = ref [] in
+   let emit i = out := i :: !out in
+   List.iter (fun i ->
+     match i with
+     | Assign (d, s) when d = s -> ()
+     | Assign (d, s) ->
+         let s' = subst s in
+         (match s' with
+          | Const n -> emit (Assign (d, Const n)); record_def d n
+          | _ -> emit (Assign (d, s')); invalidate d)
+     | AssignBinOp (d, op, a, b) ->
+         let a' = subst a and b' = subst b in
+         (match a', b' with
+          | Const x, Const y ->
+              (match fold_binop op x y with
+               | Some v -> emit (Assign (d, Const v)); record_def d v
+               | None -> emit (AssignBinOp (d, op, a', b')); invalidate d)
+          | _ ->
+              let simplified =
+                match op, a', b' with
+                | Ast.Add, x, Const 0 | Ast.Add, Const 0, x -> Some x
+                | Ast.Sub, x, Const 0 -> Some x
+                | Ast.Sub, x, y when x = y -> Some (Const 0)
+                | Ast.Mul, Const 0, _ | Ast.Mul, _, Const 0 -> Some (Const 0)
+                | Ast.Mul, Const 1, x | Ast.Mul, x, Const 1 -> Some x
+                | Ast.Div, x, Const 1 -> Some x
+                | Ast.Mod, _, Const 1 -> Some (Const 0)
+                | Ast.Eq, x, y when x = y -> Some (Const 1)
+                | Ast.Ne, x, y when x = y -> Some (Const 0)
+                | Ast.Lt, x, y when x = y -> Some (Const 0)
+                | Ast.Gt, x, y when x = y -> Some (Const 0)
+                | Ast.Le, x, y when x = y -> Some (Const 1)
+                | Ast.Ge, x, y when x = y -> Some (Const 1)
+                | _ -> None
               in
-              if dead then false, !live
-              else true, kill_def d (add_use s !live)
-          | AssignBinOp (d, _, a, b) ->
-              let dead =
-                match op_key d with
-                | Some k when killable d -> not (S.mem k !live)
-                | _ -> false
+              (match simplified with
+               | Some s -> emit (Assign (d, s)); invalidate d
+               | None -> emit (AssignBinOp (d, op, a', b')); invalidate d))
+     | AssignUnOp (d, op, a) ->
+         let a' = subst a in
+         (match a' with
+          | Const n ->
+              (match fold_unop op n with
+               | Some v -> emit (Assign (d, Const v)); record_def d v
+               | None -> emit (AssignUnOp (d, op, a')); invalidate d)
+          | _ -> emit (AssignUnOp (d, op, a')); invalidate d)
+     | IfGoto (a, l) ->
+         let a' = subst a in
+         (match a' with
+          | Const n -> if n <> 0 then emit (Goto l)
+          | _ -> emit (IfGoto (a', l)))
+     | IfNotGoto (a, l) ->
+         let a' = subst a in
+         (match a' with
+          | Const n -> if n = 0 then emit (Goto l)
+          | _ -> emit (IfNotGoto (a', l)))
+     | Param a -> emit (Param (subst a))
+     | Call (d, fname, n) ->
+         emit (Call (d, fname, n));
+         env := List.filter (fun (k, _) -> String.length k = 0 || k.[0] <> 'V') !env;
+         invalidate d
+     | Return (Some a) -> emit (Return (Some (subst a)))
+     | Goto l -> emit (Goto l)
+     | Label l -> emit (Label l); clear ()
+     | Return None -> emit (Return None)
+   ) instrs;
+   List.rev !out
+ 
+ let algebra_simplify (instrs: tac list) : tac list =
+   List.map (function
+     | AssignBinOp (d, Ast.Mul, x, Const 2)
+     | AssignBinOp (d, Ast.Mul, Const 2, x) ->
+         AssignBinOp (d, Ast.Add, x, x)
+     | AssignBinOp (d, Ast.Mul, x, Const (-1))
+     | AssignBinOp (d, Ast.Mul, Const (-1), x) ->
+         AssignUnOp (d, Ast.Neg, x)
+     | AssignBinOp (d, Ast.Div, Const 0, _) ->
+         Assign (d, Const 0)
+     | AssignBinOp (d, Ast.Mod, Const 0, _) ->
+         Assign (d, Const 0)
+     | AssignBinOp (d, Ast.And, Const 0, _)
+     | AssignBinOp (d, Ast.And, _, Const 0) ->
+         Assign (d, Const 0)
+     | AssignBinOp (d, Ast.And, Const n, x) when n <> 0 ->
+         Assign (d, x)
+     | AssignBinOp (d, Ast.And, x, Const n) when n <> 0 ->
+         Assign (d, x)
+     | AssignBinOp (d, Ast.Or, Const n, _) when n <> 0 ->
+         Assign (d, Const 1)
+     | AssignBinOp (d, Ast.Or, _, Const n) when n <> 0 ->
+         Assign (d, Const 1)
+     | AssignBinOp (d, Ast.Or, Const 0, x)
+     | AssignBinOp (d, Ast.Or, x, Const 0) ->
+         Assign (d, x)
+     | i -> i
+   ) instrs
+ 
+ (* ---------- 尾递归优化 ---------- *)
+ 
+ let tail_recursion (f: ir_func) (instrs: tac list) : tac list =
+   let fname = f.fname in
+   let params = f.params in
+   let nparams = List.length params in
+   let entry_label = f.entry.label in
+   let is_param o = match o with Var v -> List.mem v params | _ -> false in
+   let tmp = ref (count_temps instrs) in
+   let fresh () = let t = !tmp in incr tmp; Temp t in
+   let rec loop acc = function
+     | [] -> List.rev acc
+     | (Param o :: rest) as instrs when nparams > 0 ->
+         let rec collect k acc_ps = function
+           | (Param p) :: r when k > 0 -> collect (k - 1) (p :: acc_ps) r
+           | r -> List.rev acc_ps, r
+         in
+         let ps, after = collect nparams [] instrs in
+         (match after with
+          | Call (d, callee, n) :: Return (Some d') :: rest'
+            when callee = fname && n = nparams
+              && List.length ps = nparams && d = d' ->
+              let args = List.rev ps in
+              let copies =
+                List.map (fun a -> if is_param a then Some (fresh ()) else None) args
               in
-              if dead then false, !live
-              else true, kill_def d (add_use b (add_use a !live))
-          | AssignUnOp (d, _, a) ->
-              let dead =
-                match op_key d with
-                | Some k when killable d -> not (S.mem k !live)
-                | _ -> false
+              let pre =
+                List.concat
+                  (List.map2 (fun a c ->
+                     match c with Some t -> [Assign (t, a)] | None -> [])
+                     args copies)
               in
-              if dead then false, !live
-              else true, kill_def d (add_use a !live)
-          | IfGoto (a, _) | IfNotGoto (a, _) -> true, add_use a !live
-          | Param a -> true, add_use a !live
-          | Return (Some a) -> true, add_use a !live
-          | Call (d, _, _) -> true, kill_def d !live
-          | Goto _ | Label _ | Return None -> true, !live
-        in
-        live := live';
-        if keep then inst :: acc else acc)
-        b.instrs []
-    in
-    { b with instrs }
-  in
-  { f with
-    entry = rewrite f.entry 0;
-    blocks = List.mapi (fun i b -> rewrite b (i + 1)) f.blocks }
-
-(* 消除跳转到下一个基本块的冗余 Goto *)
-let cleanup (f: ir_func) : ir_func =
-  let all = f.entry :: f.blocks in
-  let aliases = Hashtbl.create 16 in
-  List.iter
-    (fun (b: basic_block) ->
-      match b.instrs with
-      | [Goto l] -> Hashtbl.replace aliases b.label l
-      | _ -> ())
-    all;
-  let rec resolve seen l =
-    if List.mem l seen then l
-    else
-      match Hashtbl.find_opt aliases l with
-      | Some l' -> resolve (l :: seen) l'
-      | None -> l
-  in
-  let rewrite_label l = resolve [] l in
-  let rewrite_jumps (b: basic_block) =
-    let instrs =
-      List.map
-        (function
-          | Goto l -> Goto (rewrite_label l)
-          | IfGoto (o, l) -> IfGoto (o, rewrite_label l)
-          | IfNotGoto (o, l) -> IfNotGoto (o, rewrite_label l)
-          | i -> i)
-        b.instrs
-    in
-    { b with instrs }
-  in
-  let all = List.map rewrite_jumps all in
-  let simplify_fallthrough next_label (b: basic_block) =
-    let instrs =
-      match List.rev b.instrs with
-      | Goto l :: rest when l = next_label ->
-          List.rev rest
-      | IfGoto (_, l) :: rest when l = next_label ->
-          List.rev rest
-      | IfNotGoto (_, l) :: rest when l = next_label ->
-          List.rev rest
-      | Goto g :: IfGoto (cond, l) :: rest when l = next_label ->
-          List.rev (IfNotGoto (cond, g) :: rest)
-      | Goto g :: IfNotGoto (cond, l) :: rest when l = next_label ->
-          List.rev (IfGoto (cond, g) :: rest)
-      | _ -> b.instrs
-    in
-    { b with instrs }
-  in
-  let rec go acc = function
-    | [] -> List.rev acc
-    | [b] -> List.rev (b :: acc)
-    | (b1: basic_block) :: (((b2: basic_block) :: _) as rest) ->
-        let b1' = simplify_fallthrough b2.label b1 in
-        go (b1' :: acc) rest
-  in
-  match go [] all with
-  | e :: r -> { f with entry = e; blocks = r }
-  | [] -> f
-
-(* 合并空基本块：空块（非入口）的所有跳转边重定向到其后继，
-   然后删除空块，使输出更紧凑 *)
-let merge_empty_blocks (f: ir_func) : ir_func =
-  let all = f.entry :: f.blocks in
-  let n = List.length all in
-  let effective = Array.make n "" in
-  for i = n - 1 downto 0 do
-    let b = List.nth all i in
-    if b.instrs = [] && i + 1 < n then effective.(i) <- effective.(i + 1)
-    else effective.(i) <- b.label
-  done;
-  let rename = Hashtbl.create 16 in
-  List.iteri (fun i (b: basic_block) ->
-    if b.instrs = [] && effective.(i) <> b.label then
-      Hashtbl.replace rename b.label effective.(i)) all;
-  let rename_l l =
-    match Hashtbl.find_opt rename l with Some l' -> l' | None -> l
-  in
-  let rewrite_block (b: basic_block) : basic_block =
-    let instrs =
-      List.map (function
-        | Goto l -> Goto (rename_l l)
-        | IfGoto (o, l) -> IfGoto (o, rename_l l)
-        | IfNotGoto (o, l) -> IfNotGoto (o, rename_l l)
-        | i -> i) b.instrs
-    in
-    { b with instrs }
-  in
-  let kept =
-    List.filteri (fun i (b: basic_block) -> i = 0 || b.instrs <> []) all
-    |> List.map rewrite_block
-  in
-  match kept with
-  | e :: r -> { f with entry = e; blocks = r }
-  | [] -> f
-
-(* 优化收尾：按最终指令重新统计临时变量与局部变量，收缩栈帧 *)
-let shrink_func (f: ir_func) : ir_func =
-  let instrs = flatten_func f in
-  let used = ref S.empty in
-  List.iter (iter_operands (function
-    | Var v -> used := S.add v !used
-    | _ -> ())) instrs;
-  let locals =
-    List.filter (fun l -> List.mem l f.params || S.mem l !used) f.locals
-  in
-  { f with temps = count_temps instrs; locals }
-
-(* ---------- 主流程 ---------- *)
-
-let global_const_prop (prog: ir_program) : ir_program =
-  let globals =
-    List.fold_left (fun s -> function
-      | GlobalVar (name, _) -> S.add name s
-      | Function _ -> s)
-      S.empty prog
-  in
-  let candidates =
-    List.fold_left (fun env -> function
-      | GlobalVar (name, Some v) -> (name, v) :: env
-      | GlobalVar (_, None) | Function _ -> env)
-      [] prog
-  in
-  let assigned = ref S.empty in
-  let note_def = function
-    | Var v when S.mem v globals -> assigned := S.add v !assigned
-    | _ -> ()
-  in
-  List.iter (function
-    | Function f ->
-        List.iter
-          (fun i -> match def_operand i with Some d -> note_def d | None -> ())
-          (flatten_func f)
-    | GlobalVar _ -> ())
-    prog;
-  let env =
-    List.filter (fun (name, _) -> not (S.mem name !assigned)) candidates
-  in
-  let subst = function
-    | Var v ->
-        (match List.assoc_opt v env with
-         | Some n -> Const n
-         | None -> Var v)
-    | o -> o
-  in
-  let rewrite_func f =
-    rebuild_func f (List.map (substitute_operands subst) (flatten_func f))
-  in
-  List.map (function
-    | Function f -> Function (rewrite_func f)
-    | GlobalVar _ as g -> g)
-    prog
-
-let split_at n xs =
-  let rec go n left rest =
-    if n <= 0 then List.rev left, rest
-    else
-      match rest with
-      | [] -> List.rev left, []
-      | x :: xs -> go (n - 1) (x :: left) xs
-  in
-  go n [] xs
-
-let const_eval_program (prog: ir_program) : ir_program =
-  let funcs =
-    List.filter_map (function Function f -> Some (f.fname, f) | GlobalVar _ -> None) prog
-  in
-  let globals =
-    List.fold_left (fun env -> function
-      | GlobalVar (name, Some v) -> ("V" ^ name, v) :: env
-      | GlobalVar (_, None) | Function _ -> env)
-      [] prog
-  in
-  (* 程序里任何位置被赋值过的全局变量：折叠调用时，若被调函数（含传递调用）
-     读取了其中任何一个，其值在调用点可能已被调用者修改，不能用初值解释。 *)
-  let assigned_globals =
-    List.fold_left (fun s -> function
-      | Function f ->
+              let assigns =
+                List.map2 (fun p (c, a) ->
+                  Assign (Var p, match c with Some t -> t | None -> a))
+                  params (List.combine copies args)
+              in
+              loop (List.rev_append (pre @ assigns @ [Goto entry_label]) acc) rest'
+          | _ -> loop (Param o :: acc) rest)
+     | Call (d, callee, 0) :: Return (Some d') :: rest
+       when callee = fname && nparams = 0 && d = d' ->
+         loop (Goto entry_label :: acc) rest
+     | i :: rest -> loop (i :: acc) rest
+   in
+   loop [] instrs
+ 
+ (* ---------- 死代码消除 ---------- *)
+ 
+ let normalize_entry (f: ir_func) (instrs: tac list) : ir_func * tac list =
+   if f.entry.label <> "entry" then f, instrs
+   else
+     let l = fresh_label () in
+     let instrs =
+       match instrs with
+       | Label _ :: rest -> Label l :: rest
+       | _ -> Label l :: instrs
+     in
+     { f with entry = { f.entry with label = l } }, instrs
+ 
+ let truncate_block (b: basic_block) : basic_block =
+   let rec go acc = function
+     | [] -> List.rev acc
+     | ((Goto _ | Return _) as i) :: _ -> List.rev (i :: acc)
+     | i :: rest -> go (i :: acc) rest
+   in
+   { b with instrs = go [] b.instrs }
+ 
+ let truncate_func (f: ir_func) : ir_func =
+   { f with
+     entry = truncate_block f.entry;
+     blocks = List.map truncate_block f.blocks }
+ 
+ let block_succs (all: basic_block list) : int list list =
+   let n = List.length all in
+   let idx = Hashtbl.create 16 in
+   List.iteri (fun i b -> Hashtbl.replace idx b.label i) all;
+   let target l =
+     match Hashtbl.find_opt idx l with Some j -> [j] | None -> []
+   in
+   List.mapi (fun i (b: basic_block) ->
+     let next = if i + 1 < n then [i + 1] else [] in
+     let targets = ref [] in
+     List.iter (function
+       | Goto l | IfGoto (_, l) | IfNotGoto (_, l) -> targets := l :: !targets
+       | _ -> ()) b.instrs;
+     let ts = List.concat_map target (List.rev !targets) in
+     let terminated =
+       match List.rev b.instrs with
+       | (Goto _ | Return _) :: _ -> true
+       | _ -> false
+     in
+     if terminated then ts else ts @ next) all
+ 
+ let const_prop_cfg (f: ir_func) : ir_func =
+   let all = f.entry :: f.blocks in
+   let n = List.length all in
+   if n = 0 then f
+   else
+     let succs = Array.of_list (block_succs all) in
+     let preds = Array.make n [] in
+     Array.iteri
+       (fun i js ->
+         List.iter
+           (fun j ->
+             if j >= 0 && j < n then preds.(j) <- i :: preds.(j))
+           js)
+       succs;
+     let tracked = function
+       | Temp _ -> true
+       | Var v -> List.mem v f.params || List.mem v f.locals
+       | Const _ -> false
+     in
+     let env_find o env =
+       match op_key o with
+       | Some k -> M.find_opt k env
+       | None -> None
+     in
+     let subst env = function
+       | Const _ as c -> c
+       | (Temp _ | Var _) as o ->
+           (match env_find o env with Some n -> Const n | None -> o)
+     in
+     let env_set d v env =
+       match op_key d with
+       | Some k when tracked d -> M.add k v env
+       | _ -> env
+     in
+     let env_drop d env =
+       match op_key d with
+       | Some k when tracked d -> M.remove k env
+       | _ -> env
+     in
+     let meet envs =
+       match envs with
+       | [] -> M.empty
+       | first :: rest ->
+           M.filter
+             (fun k v -> List.for_all (fun e -> M.find_opt k e = Some v) rest)
+             first
+     in
+     let transfer env instrs =
+       let env = ref env in
+       let out = ref [] in
+       let emit i = out := i :: !out in
+       let def_const d v =
+         env := env_set d v !env;
+         emit (Assign (d, Const v))
+       in
+       List.iter
+         (fun inst ->
+           match inst with
+           | Assign (d, s) ->
+               let s' = subst !env s in
+               (match s' with
+                | Const n -> def_const d n
+                | _ ->
+                    env := env_drop d !env;
+                    if d <> s' then emit (Assign (d, s')))
+           | AssignBinOp (d, op, a, b) ->
+               let a' = subst !env a and b' = subst !env b in
+               (match a', b' with
+                | Const x, Const y ->
+                    (match fold_binop op x y with
+                     | Some v -> def_const d v
+                     | None ->
+                         env := env_drop d !env;
+                         emit (AssignBinOp (d, op, a', b')))
+                | _ ->
+                    env := env_drop d !env;
+                    emit (AssignBinOp (d, op, a', b')))
+           | AssignUnOp (d, op, a) ->
+               let a' = subst !env a in
+               (match a' with
+                | Const x ->
+                    (match fold_unop op x with
+                     | Some v -> def_const d v
+                     | None ->
+                         env := env_drop d !env;
+                         emit (AssignUnOp (d, op, a')))
+                | _ ->
+                    env := env_drop d !env;
+                    emit (AssignUnOp (d, op, a')))
+           | IfGoto (a, l) ->
+               (match subst !env a with
+                | Const n -> if n <> 0 then emit (Goto l)
+                | a' -> emit (IfGoto (a', l)))
+           | IfNotGoto (a, l) ->
+               (match subst !env a with
+                | Const n -> if n = 0 then emit (Goto l)
+                | a' -> emit (IfNotGoto (a', l)))
+           | Param a ->
+               emit (Param (subst !env a))
+           | Call (d, callee, nargs) ->
+               env := env_drop d !env;
+               emit (Call (d, callee, nargs))
+           | Return (Some a) ->
+               emit (Return (Some (subst !env a)))
+           | Goto _  | Label _ | Return None ->
+               emit inst)
+         instrs;
+       !env, List.rev !out
+     in
+     let in_env = Array.make n M.empty in
+     let out_env = Array.make n M.empty in
+     let changed = ref true in
+     while !changed do
+       changed := false;
+       for i = 0 to n - 1 do
+         let input =
+           if i = 0 then M.empty
+           else meet (List.map (fun p -> out_env.(p)) preds.(i))
+         in
+         if not (M.equal (=) input in_env.(i)) then (
+           in_env.(i) <- input;
+           changed := true);
+         let output, _ = transfer input (List.nth all i).instrs in
+         if not (M.equal (=) output out_env.(i)) then (
+           out_env.(i) <- output;
+           changed := true)
+       done
+     done;
+     let rewritten =
+       List.mapi
+         (fun i (b: basic_block) ->
+           let _, instrs = transfer in_env.(i) b.instrs in
+           { b with instrs })
+         all
+     in
+     match rewritten with
+     | entry :: blocks -> { f with entry; blocks }
+     | [] -> f
+ 
+ let remove_unreachable_blocks (f: ir_func) : ir_func =
+   let all = f.entry :: f.blocks in
+   let succs = Array.of_list (block_succs all) in
+   let n = List.length all in
+   let reachable = Array.make n false in
+   let queue = Queue.create () in
+   reachable.(0) <- true;
+   Queue.push 0 queue;
+   while not (Queue.is_empty queue) do
+     let i = Queue.pop queue in
+     List.iter (fun j ->
+       if j >= 0 && j < n && not reachable.(j) then (
+         reachable.(j) <- true;
+         Queue.push j queue))
+       succs.(i)
+   done;
+   let kept =
+     List.filteri (fun i _ -> reachable.(i)) all
+   in
+   match kept with
+   | e :: r -> { f with entry = e; blocks = r }
+   | [] -> { f with entry = { label = f.entry.label; instrs = [] }; blocks = [] }
+ 
+ let dce (f: ir_func) : ir_func =
+   let all = f.entry :: f.blocks in
+   let succs = Array.of_list (block_succs all) in
+   let n = List.length all in
+   let killable_names =
+     List.fold_left (fun s v -> S.add v s) S.empty (f.params @ f.locals)
+   in
+   let killable = function
+     | Temp _ -> true
+     | Var v -> S.mem v killable_names
+     | Const _ -> false
+   in
+   let add_use o s = match op_key o with Some k -> S.add k s | None -> s in
+   let kill_def o s =
+     match op_key o with
+     | Some k when killable o -> S.remove k s
+     | _ -> s
+   in
+   let uses_of = function
+     | Assign (_, y) -> [y]
+     | AssignBinOp (_, _, a, b) -> [a; b]
+     | AssignUnOp (_, _, a) -> [a]
+     | IfGoto (a, _) | IfNotGoto (a, _) -> [a]
+     | Param a -> [a]
+     | Return (Some a) -> [a]
+     | _ -> []
+   in
+   let def_of = function
+     | Assign (x, _) | AssignBinOp (x, _, _, _) | AssignUnOp (x, _, _)
+     | Call (x, _, _) -> Some x
+     | _ -> None
+   in
+   let use_arr =
+     Array.of_list
+       (List.map (fun (b: basic_block) ->
           List.fold_left (fun s i ->
-            match def_operand i with
-            | Some (Var v) when not (String.contains v '$') -> S.add v s
-            | _ -> s)
-            s (flatten_func f)
-      | GlobalVar _ -> s)
-      S.empty prog
-  in
-  (* 每个函数直接或通过调用传递读取的全局变量集合（含写入，保守处理） *)
-  let reads_globals = Hashtbl.create 16 in
-  List.iter (fun (fname, f) ->
-    let s = ref S.empty in
-    List.iter (iter_operands (function
-      | Var v when not (String.contains v '$') -> s := S.add v !s
-      | _ -> ())) (flatten_func f);
-    Hashtbl.replace reads_globals fname !s)
-    funcs;
-  let changed = ref true in
-  while !changed do
-    changed := false;
-    List.iter (fun (fname, f) ->
-      let cur = Hashtbl.find reads_globals fname in
-      let next =
-        List.fold_left (fun s i ->
-          match i with
-          | Call (_, callee, _) ->
-              (match Hashtbl.find_opt reads_globals callee with
-               | Some r -> S.union s r
-               | None -> s)
-          | _ -> s)
-          cur (flatten_func f)
-      in
-      if not (S.equal next cur) then (
-        Hashtbl.replace reads_globals fname next;
-        changed := true))
-      funcs
-  done;
-  let rec eval_func fuel depth fname args =
-    if fuel <= 0 || depth > 16 then None
-    else
-      match List.assoc_opt fname funcs with
-      | None -> None
-      | Some f ->
-          if List.length f.params <> List.length args then None
-          else
-          let instrs = Array.of_list (flatten_func f) in
-          let labels = Hashtbl.create 32 in
-          Array.iteri (fun i -> function Label l -> Hashtbl.replace labels l i | _ -> ()) instrs;
-          let env = ref globals in
-          List.iter2
-            (fun p v -> env := ("V" ^ p, v) :: List.remove_assoc ("V" ^ p) !env)
-            f.params args;
-          let args_stack = ref [] in
-          let get = function
-            | Const n -> Some n
-            | Temp t -> List.assoc_opt ("T" ^ string_of_int t) !env
-            | Var v -> List.assoc_opt ("V" ^ v) !env
-          in
-          let set o v =
-            match op_key o with
-            | Some k -> env := (k, v) :: List.remove_assoc k !env; true
-            | None -> false
-          in
-          let local_or_temp = function
-            | Temp _ -> true
-            | Var v -> List.mem v f.params || List.mem v f.locals
-            | Const _ -> false
-          in
-          let rec run fuel pc =
-            if fuel <= 0 || pc < 0 || pc >= Array.length instrs then None
-            else
-              match instrs.(pc) with
-              | Label _ -> run (fuel - 1) (pc + 1)
-              | Assign (d, s) ->
-                  if not (local_or_temp d) then None
-                  else (match get s with Some v when set d v -> run (fuel - 1) (pc + 1) | _ -> None)
-              | AssignBinOp (d, op, a, b) ->
-                  if not (local_or_temp d) then None
-                  else
-                    (match get a, get b with
-                     | Some x, Some y ->
-                         (match fold_binop op x y with
-                          | Some v when set d v -> run (fuel - 1) (pc + 1)
-                          | _ -> None)
-                     | _ -> None)
-              | AssignUnOp (d, op, a) ->
-                  if not (local_or_temp d) then None
-                  else
-                    (match get a with
-                     | Some x ->
-                         (match fold_unop op x with
-                          | Some v when set d v -> run (fuel - 1) (pc + 1)
-                          | _ -> None)
-                     | None -> None)
-              | Goto l ->
-                  (match Hashtbl.find_opt labels l with
-                   | Some target -> run (fuel - 1) target
-                   | None -> None)
-              | IfGoto (a, l) ->
-                  (match get a with
-                   | Some v when v <> 0 ->
-                       (match Hashtbl.find_opt labels l with
-                        | Some target -> run (fuel - 1) target
-                        | None -> None)
-                   | Some _ -> run (fuel - 1) (pc + 1)
-                   | None -> None)
-              | IfNotGoto (a, l) ->
-                  (match get a with
-                   | Some 0 ->
-                       (match Hashtbl.find_opt labels l with
-                        | Some target -> run (fuel - 1) target
-                        | None -> None)
-                   | Some _ -> run (fuel - 1) (pc + 1)
-                   | None -> None)
-              | Param a ->
-                  (match get a with
-                   | Some v -> args_stack := v :: !args_stack; run (fuel - 1) (pc + 1)
-                   | None -> None)
-              | Call (d, callee, nargs) ->
-                  if not (local_or_temp d) then None
-                  else
-                    let call_args, rem = split_at nargs !args_stack in
-                    args_stack := rem;
-                    if List.length call_args <> nargs then None
-                    else
-                      (match eval_func (fuel - 1) (depth + 1) callee call_args with
-                       | Some v when set d v -> run (fuel - 1) (pc + 1)
-                       | _ -> None)
-              | Return (Some a) -> get a
-              | Return None -> Some 0
-          in
-          (try run fuel 0 with Invalid_argument _ -> None)
-  in
-  let const_arg = function Const n -> Some n | _ -> None in
-  let fold_func f =
-    let rec go acc arg_stack = function
-      | [] ->
-          let pending = List.rev (List.map fst arg_stack) in
-          rebuild_func f (List.rev (List.fold_left (fun a i -> i :: a) acc pending))
-      | Param a :: rest ->
-          go acc ((Param a, const_arg a) :: arg_stack) rest
-      | Call (d, callee, nargs) :: rest ->
-          let call_args, rem = split_at nargs arg_stack in
-          let arg_vals = List.map snd call_args in
-          let can_fold =
-            List.length call_args = nargs
-            && List.for_all (function Some _ -> true | None -> false) arg_vals
-            && (match Hashtbl.find_opt reads_globals callee with
-                | Some r -> S.is_empty (S.inter r assigned_globals)
-                | None -> false)
-          in
-          if can_fold then
-            let vals = List.map (function Some v -> v | None -> assert false) arg_vals in
-            (match eval_func 5000000 0 callee vals with
-             | Some v -> go (Assign (d, Const v) :: acc) rem rest
-             | None ->
-                 let pending = List.rev (List.map fst call_args) in
-                 let acc = List.fold_left (fun a i -> i :: a) acc pending in
-                 go (Call (d, callee, nargs) :: acc) rem rest)
-          else
-            let pending = List.rev (List.map fst call_args) in
-            let acc = List.fold_left (fun a i -> i :: a) acc pending in
-            go (Call (d, callee, nargs) :: acc) rem rest
-      | i :: rest ->
-          let pending = List.rev (List.map fst arg_stack) in
-          let acc = List.fold_left (fun a p -> p :: a) acc pending in
-          go (i :: acc) [] rest
-    in
-    go [] [] (flatten_func f)
-  in
-  List.map (function
-    | Function f -> Function (fold_func f)
-    | GlobalVar _ as g -> g)
-    prog
-
-let optimize_linear (params: string list) (instrs: tac list) : tac list =
-  instrs
-  |> single_assign_const_prop params
-  |> const_fold
-  |> algebra_simplify
-  |> copy_prop
-  |> common_subexpr
-  |> copy_prop
-  |> single_assign_const_prop params
-  |> const_fold
-  |> algebra_simplify
-
-let rec repeat_linear (params: string list) n instrs =
-  if n <= 0 then instrs
-  else
-    let instrs' = optimize_linear params instrs in
-    if instrs' = instrs then instrs else repeat_linear params (n - 1) instrs'
-
-let optimize_func (f: ir_func) : ir_func =
-  let instrs = flatten_func f in
-  let f, instrs = normalize_entry f instrs in
-  let instrs = repeat_linear f.params 3 instrs in
-  let instrs = tail_recursion f instrs in
-  let instrs = repeat_linear f.params 3 instrs in
-  let f = rebuild_func f instrs in
-  let f = truncate_func f in
-  let f = remove_unreachable_blocks f in
-  let f = const_prop_cfg f in
-  let f = rebuild_func f (repeat_linear f.params 2 (flatten_func f)) in
-  let f = truncate_func f in
-  let f = remove_unreachable_blocks f in
-  let f = dce f in
-  let f = rebuild_func f (repeat_linear f.params 2 (flatten_func f)) in
-  let f = dce f in
-  let f = merge_empty_blocks f in
-  let f = cleanup f in
-  let f = remove_unreachable_blocks f in
-  let f = shrink_func f in
-  f
-
-(* 对整个 IR 程序做优化：逐个函数处理，全局变量保持不变 *)
-let optimize_program (prog: ir_program) : ir_program =
-  let prog = global_const_prop prog in
-  let prog =
-    List.map (function
-      | GlobalVar _ as g -> g
-      | Function f -> Function (optimize_func f))
-      prog
-  in
-  let prog = const_eval_program prog in
-  List.map (function
-    | GlobalVar _ as g -> g
-    | Function f -> Function (optimize_func f)
-  ) prog
+            List.fold_left (fun s o -> add_use o s) s (uses_of i))
+            S.empty b.instrs) all)
+   in
+   let kill_arr =
+     Array.of_list
+       (List.map (fun (b: basic_block) ->
+          List.fold_left (fun s i ->
+            match def_of i with
+            | Some d -> kill_def d s
+            | None -> s) S.empty b.instrs) all)
+   in
+   let live_in = Array.make n S.empty in
+   let live_out = Array.make n S.empty in
+   let changed = ref true in
+   while !changed do
+     changed := false;
+     for i = n - 1 downto 0 do
+       let li = S.union use_arr.(i) (S.diff live_out.(i) kill_arr.(i)) in
+       if not (S.equal li live_in.(i)) then (live_in.(i) <- li; changed := true);
+       let lo =
+         List.fold_left (fun s j -> S.union s live_in.(j)) S.empty succs.(i)
+       in
+       if not (S.equal lo live_out.(i)) then (live_out.(i) <- lo; changed := true)
+     done
+   done;
+   let rewrite (b: basic_block) i =
+     let live = ref live_out.(i) in
+     let instrs =
+       List.fold_right (fun inst acc ->
+         let keep, live' =
+           match inst with
+           | Assign (d, s) when d = s -> false, !live
+           | Assign (d, s) ->
+               let dead =
+                 match op_key d with
+                 | Some k when killable d -> not (S.mem k !live)
+                 | _ -> false
+               in
+               if dead then false, !live
+               else true, kill_def d (add_use s !live)
+           | AssignBinOp (d, _, a, b) ->
+               let dead =
+                 match op_key d with
+                 | Some k when killable d -> not (S.mem k !live)
+                 | _ -> false
+               in
+               if dead then false, !live
+               else true, kill_def d (add_use b (add_use a !live))
+           | AssignUnOp (d, _, a) ->
+               let dead =
+                 match op_key d with
+                 | Some k when killable d -> not (S.mem k !live)
+                 | _ -> false
+               in
+               if dead then false, !live
+               else true, kill_def d (add_use a !live)
+           | IfGoto (a, _) | IfNotGoto (a, _) -> true, add_use a !live
+           | Param a -> true, add_use a !live
+           | Return (Some a) -> true, add_use a !live
+           | Call (d, _, _) -> true, kill_def d !live
+           | Goto _ | Label _ | Return None -> true, !live
+         in
+         live := live';
+         if keep then inst :: acc else acc)
+         b.instrs []
+     in
+     { b with instrs }
+   in
+   { f with
+     entry = rewrite f.entry 0;
+     blocks = List.mapi (fun i b -> rewrite b (i + 1)) f.blocks }
+ 
+ let cleanup (f: ir_func) : ir_func =
+   let all = f.entry :: f.blocks in
+   let aliases = Hashtbl.create 16 in
+   List.iter
+     (fun (b: basic_block) ->
+       match b.instrs with
+       | [Goto l] -> Hashtbl.replace aliases b.label l
+       | _ -> ())
+     all;
+   let rec resolve seen l =
+     if List.mem l seen then l
+     else
+       match Hashtbl.find_opt aliases l with
+       | Some l' -> resolve (l :: seen) l'
+       | None -> l
+   in
+   let rewrite_label l = resolve [] l in
+   let rewrite_jumps (b: basic_block) =
+     let instrs =
+       List.map
+         (function
+           | Goto l -> Goto (rewrite_label l)
+           | IfGoto (o, l) -> IfGoto (o, rewrite_label l)
+           | IfNotGoto (o, l) -> IfNotGoto (o, rewrite_label l)
+           | i -> i)
+         b.instrs
+     in
+     { b with instrs }
+   in
+   let all = List.map rewrite_jumps all in
+   let simplify_fallthrough next_label (b: basic_block) =
+     let instrs =
+       match List.rev b.instrs with
+       | Goto l :: rest when l = next_label ->
+           List.rev rest
+       | IfGoto (_, l) :: rest when l = next_label ->
+           List.rev rest
+       | IfNotGoto (_, l) :: rest when l = next_label ->
+           List.rev rest
+       | Goto g :: IfGoto (cond, l) :: rest when l = next_label ->
+           List.rev (IfNotGoto (cond, g) :: rest)
+       | Goto g :: IfNotGoto (cond, l) :: rest when l = next_label ->
+           List.rev (IfGoto (cond, g) :: rest)
+       | _ -> b.instrs
+     in
+     { b with instrs }
+   in
+   let rec go acc = function
+     | [] -> List.rev acc
+     | [b] -> List.rev (b :: acc)
+     | (b1: basic_block) :: (((b2: basic_block) :: _) as rest) ->
+         let b1' = simplify_fallthrough b2.label b1 in
+         go (b1' :: acc) rest
+   in
+   match go [] all with
+   | e :: r -> { f with entry = e; blocks = r }
+   | [] -> f
+ 
+ let merge_empty_blocks (f: ir_func) : ir_func =
+   let all = f.entry :: f.blocks in
+   let n = List.length all in
+   let effective = Array.make n "" in
+   for i = n - 1 downto 0 do
+     let b = List.nth all i in
+     if b.instrs = [] && i + 1 < n then effective.(i) <- effective.(i + 1)
+     else effective.(i) <- b.label
+   done;
+   let rename = Hashtbl.create 16 in
+   List.iteri (fun i (b: basic_block) ->
+     if b.instrs = [] && effective.(i) <> b.label then
+       Hashtbl.replace rename b.label effective.(i)) all;
+   let rename_l l =
+     match Hashtbl.find_opt rename l with Some l' -> l' | None -> l
+   in
+   let rewrite_block (b: basic_block) : basic_block =
+     let instrs =
+       List.map (function
+         | Goto l -> Goto (rename_l l)
+         | IfGoto (o, l) -> IfGoto (o, rename_l l)
+         | IfNotGoto (o, l) -> IfNotGoto (o, rename_l l)
+         | i -> i) b.instrs
+     in
+     { b with instrs }
+   in
+   let kept =
+     List.filteri (fun i (b: basic_block) -> i = 0 || b.instrs <> []) all
+     |> List.map rewrite_block
+   in
+   match kept with
+   | e :: r -> { f with entry = e; blocks = r }
+   | [] -> f
+ 
+ let shrink_func (f: ir_func) : ir_func =
+   let instrs = flatten_func f in
+   let used = ref S.empty in
+   List.iter (iter_operands (function
+     | Var v -> used := S.add v !used
+     | _ -> ())) instrs;
+   let locals =
+     List.filter (fun l -> List.mem l f.params || S.mem l !used) f.locals
+   in
+   { f with temps = count_temps instrs; locals }
+ 
+ (* ---------- 全局常量传播 ---------- *)
+ 
+ let global_const_prop (prog: ir_program) : ir_program =
+   let globals =
+     List.fold_left (fun s -> function
+       | GlobalVar (name, _) -> S.add name s
+       | Function _ -> s)
+       S.empty prog
+   in
+   let candidates =
+     List.fold_left (fun env -> function
+       | GlobalVar (name, Some v) -> (name, v) :: env
+       | GlobalVar (_, None) | Function _ -> env)
+       [] prog
+   in
+   let assigned = ref S.empty in
+   let note_def = function
+     | Var v when S.mem v globals -> assigned := S.add v !assigned
+     | _ -> ()
+   in
+   List.iter (function
+     | Function f ->
+         List.iter
+           (fun i -> match def_operand i with Some d -> note_def d | None -> ())
+           (flatten_func f)
+     | GlobalVar _ -> ())
+     prog;
+   let env =
+     List.filter (fun (name, _) -> not (S.mem name !assigned)) candidates
+   in
+   let subst = function
+     | Var v ->
+         (match List.assoc_opt v env with
+          | Some n -> Const n
+          | None -> Var v)
+     | o -> o
+   in
+   let rewrite_func f =
+     rebuild_func f (List.map (substitute_operands subst) (flatten_func f))
+   in
+   List.map (function
+     | Function f -> Function (rewrite_func f)
+     | GlobalVar _ as g -> g)
+     prog
+ 
+ let split_at n xs =
+   let rec go n left rest =
+     if n <= 0 then List.rev left, rest
+     else
+       match rest with
+       | [] -> List.rev left, []
+       | x :: xs -> go (n - 1) (x :: left) xs
+   in
+   go n [] xs
+ 
+ let const_eval_program (prog: ir_program) : ir_program =
+   let funcs =
+     List.filter_map (function Function f -> Some (f.fname, f) | GlobalVar _ -> None) prog
+   in
+   let globals =
+     List.fold_left (fun env -> function
+       | GlobalVar (name, Some v) -> ("V" ^ name, v) :: env
+       | GlobalVar (_, None) | Function _ -> env)
+       [] prog
+   in
+   let assigned_globals =
+     List.fold_left (fun s -> function
+       | Function f ->
+           List.fold_left (fun s i ->
+             match def_operand i with
+             | Some (Var v) when not (String.contains v '$') -> S.add v s
+             | _ -> s)
+             s (flatten_func f)
+       | GlobalVar _ -> s)
+       S.empty prog
+   in
+   let reads_globals = Hashtbl.create 16 in
+   List.iter (fun (fname, f) ->
+     let s = ref S.empty in
+     List.iter (iter_operands (function
+       | Var v when not (String.contains v '$') -> s := S.add v !s
+       | _ -> ())) (flatten_func f);
+     Hashtbl.replace reads_globals fname !s)
+     funcs;
+   let changed = ref true in
+   while !changed do
+     changed := false;
+     List.iter (fun (fname, f) ->
+       let cur = Hashtbl.find reads_globals fname in
+       let next =
+         List.fold_left (fun s i ->
+           match i with
+           | Call (_, callee, _) ->
+               (match Hashtbl.find_opt reads_globals callee with
+                | Some r -> S.union s r
+                | None -> s)
+           | _ -> s)
+           cur (flatten_func f)
+       in
+       if not (S.equal next cur) then (
+         Hashtbl.replace reads_globals fname next;
+         changed := true))
+       funcs
+   done;
+   let rec eval_func fuel depth fname args =
+     if fuel <= 0 || depth > 16 then None
+     else
+       match List.assoc_opt fname funcs with
+       | None -> None
+       | Some f ->
+           if List.length f.params <> List.length args then None
+           else
+           let instrs = Array.of_list (flatten_func f) in
+           let labels = Hashtbl.create 32 in
+           Array.iteri (fun i -> function Label l -> Hashtbl.replace labels l i | _ -> ()) instrs;
+           let env = ref globals in
+           List.iter2
+             (fun p v -> env := ("V" ^ p, v) :: List.remove_assoc ("V" ^ p) !env)
+             f.params args;
+           let args_stack = ref [] in
+           let get = function
+             | Const n -> Some n
+             | Temp t -> List.assoc_opt ("T" ^ string_of_int t) !env
+             | Var v -> List.assoc_opt ("V" ^ v) !env
+           in
+           let set o v =
+             match op_key o with
+             | Some k -> env := (k, v) :: List.remove_assoc k !env; true
+             | None -> false
+           in
+           let local_or_temp = function
+             | Temp _ -> true
+             | Var v -> List.mem v f.params || List.mem v f.locals
+             | Const _ -> false
+           in
+           let rec run fuel pc =
+             if fuel <= 0 || pc < 0 || pc >= Array.length instrs then None
+             else
+               match instrs.(pc) with
+               | Label _ -> run (fuel - 1) (pc + 1)
+               | Assign (d, s) ->
+                   if not (local_or_temp d) then None
+                   else (match get s with Some v when set d v -> run (fuel - 1) (pc + 1) | _ -> None)
+               | AssignBinOp (d, op, a, b) ->
+                   if not (local_or_temp d) then None
+                   else
+                     (match get a, get b with
+                      | Some x, Some y ->
+                          (match fold_binop op x y with
+                           | Some v when set d v -> run (fuel - 1) (pc + 1)
+                           | _ -> None)
+                      | _ -> None)
+               | AssignUnOp (d, op, a) ->
+                   if not (local_or_temp d) then None
+                   else
+                     (match get a with
+                      | Some x ->
+                          (match fold_unop op x with
+                           | Some v when set d v -> run (fuel - 1) (pc + 1)
+                           | _ -> None)
+                      | None -> None)
+               | Goto l ->
+                   (match Hashtbl.find_opt labels l with
+                    | Some target -> run (fuel - 1) target
+                    | None -> None)
+               | IfGoto (a, l) ->
+                   (match get a with
+                    | Some v when v <> 0 ->
+                        (match Hashtbl.find_opt labels l with
+                         | Some target -> run (fuel - 1) target
+                         | None -> None)
+                    | Some _ -> run (fuel - 1) (pc + 1)
+                    | None -> None)
+               | IfNotGoto (a, l) ->
+                   (match get a with
+                    | Some 0 ->
+                        (match Hashtbl.find_opt labels l with
+                         | Some target -> run (fuel - 1) target
+                         | None -> None)
+                    | Some _ -> run (fuel - 1) (pc + 1)
+                    | None -> None)
+               | Param a ->
+                   (match get a with
+                    | Some v -> args_stack := v :: !args_stack; run (fuel - 1) (pc + 1)
+                    | None -> None)
+               | Call (d, callee, nargs) ->
+                   if not (local_or_temp d) then None
+                   else
+                     let call_args, rem = split_at nargs !args_stack in
+                     args_stack := rem;
+                     if List.length call_args <> nargs then None
+                     else
+                       (match eval_func (fuel - 1) (depth + 1) callee call_args with
+                        | Some v when set d v -> run (fuel - 1) (pc + 1)
+                        | _ -> None)
+               | Return (Some a) -> get a
+               | Return None -> Some 0
+           in
+           (try run fuel 0 with Invalid_argument _ -> None)
+   in
+   let const_arg = function Const n -> Some n | _ -> None in
+   let fold_func f =
+     let rec go acc arg_stack = function
+       | [] ->
+           let pending = List.rev (List.map fst arg_stack) in
+           rebuild_func f (List.rev (List.fold_left (fun a i -> i :: a) acc pending))
+       | Param a :: rest ->
+           go acc ((Param a, const_arg a) :: arg_stack) rest
+       | Call (d, callee, nargs) :: rest ->
+           let call_args, rem = split_at nargs arg_stack in
+           let arg_vals = List.map snd call_args in
+           let can_fold =
+             List.length call_args = nargs
+             && List.for_all (function Some _ -> true | None -> false) arg_vals
+             && (match Hashtbl.find_opt reads_globals callee with
+                 | Some r -> S.is_empty (S.inter r assigned_globals)
+                 | None -> false)
+           in
+           if can_fold then
+             let vals = List.map (function Some v -> v | None -> assert false) arg_vals in
+             (match eval_func 5000000 0 callee vals with
+              | Some v -> go (Assign (d, Const v) :: acc) rem rest
+              | None ->
+                  let pending = List.rev (List.map fst call_args) in
+                  let acc = List.fold_left (fun a i -> i :: a) acc pending in
+                  go (Call (d, callee, nargs) :: acc) rem rest)
+           else
+             let pending = List.rev (List.map fst call_args) in
+             let acc = List.fold_left (fun a i -> i :: a) acc pending in
+             go (Call (d, callee, nargs) :: acc) rem rest
+       | i :: rest ->
+           let pending = List.rev (List.map fst arg_stack) in
+           let acc = List.fold_left (fun a p -> p :: a) acc pending in
+           go (i :: acc) [] rest
+     in
+     go [] [] (flatten_func f)
+   in
+   List.map (function
+     | Function f -> Function (fold_func f)
+     | GlobalVar _ as g -> g)
+     prog
+ 
+ (* ---------- 优化管道 ---------- *)
+ 
+ let optimize_linear (params: string list) (instrs: tac list) : tac list =
+   instrs
+   |> single_assign_const_prop params
+   |> const_fold
+   |> algebra_simplify
+   |> copy_prop
+   |> common_subexpr
+   |> copy_prop
+   |> single_assign_const_prop params
+   |> const_fold
+   |> algebra_simplify
+ 
+ let rec repeat_linear (params: string list) n instrs =
+   if n <= 0 then instrs
+   else
+     let instrs' = optimize_linear params instrs in
+     if instrs' = instrs then instrs else repeat_linear params (n - 1) instrs'
+ 
+ let optimize_func (f: ir_func) : ir_func =
+   let instrs = flatten_func f in
+   let f, instrs = normalize_entry f instrs in
+   let instrs = repeat_linear f.params 3 instrs in
+   let instrs = tail_recursion f instrs in
+   let instrs = repeat_linear f.params 3 instrs in
+   let f = rebuild_func f instrs in
+   let f = truncate_func f in
+   
+   let f = remove_unreachable_blocks f in
+   
+   
+   
+   let f = const_prop_cfg f in
+   let f = rebuild_func f (repeat_linear f.params 2 (flatten_func f)) in
+   let f = truncate_func f in
+   let f = remove_unreachable_blocks f in
+   let f = dce f in
+   let f = rebuild_func f (repeat_linear f.params 2 (flatten_func f)) in
+   let f = dce f in
+   let f = merge_empty_blocks f in
+   let f = cleanup f in
+   let f = remove_unreachable_blocks f in
+   let f = shrink_func f in
+   f
+ 
+ (* 对整个 IR 程序做优化：逐个函数处理，全局变量保持不变 *)
+ let optimize_program (prog: ir_program) : ir_program =
+   let prog = global_const_prop prog in
+   let prog =
+     List.map (function
+       | GlobalVar _ as g -> g
+       | Function f -> Function (optimize_func f))
+       prog
+   in
+   let prog = const_eval_program prog in
+   List.map (function
+     | GlobalVar _ as g -> g
+     | Function f -> Function (optimize_func f)
+   ) prog

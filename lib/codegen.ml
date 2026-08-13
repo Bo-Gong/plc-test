@@ -451,11 +451,11 @@ let emit_logic x op y z map =
 let emit_tac fname tac_inst map current_args needs_frame =
   match tac_inst with
   | Assign (x, y) ->
-      if x = y then
-        ()
-      else
-        load_op "t0" y map;
-        store_op "t0" x map
+    if x = y then
+      ()
+    else
+      load_op "t0" y map;
+      store_op "t0" x map
 
   | AssignBinOp (x, op, y, z) ->
       (match op with
