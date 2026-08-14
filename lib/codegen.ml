@@ -554,6 +554,7 @@ let emit_function (f: ir_func) =
   let slots, map = compute_offsets f in
   
   let is_leaf = is_leaf_function f in
+  let not_leaf = not is_leaf in
   let has_locals = has_local_storage f in
   let has_params = List.length f.params > 0 in
   let needs_frame = (not is_leaf) || has_locals || has_params in
@@ -565,10 +566,12 @@ let emit_function (f: ir_func) =
   
   if needs_frame then (
     Printf.printf "    addi sp, sp, -%d\n" framesize;
+    if  not_leaf then(
+    
     Printf.printf "    sw ra, %d(sp)\n" (framesize - 4);
+    );
     Printf.printf "    sw fp, %d(sp)\n" (framesize - 8);
     Printf.printf "    addi fp, sp, %d\n" framesize;
-    
     List.iteri (fun i name ->
       if i < 8 then
         let off = Hashtbl.find map (Var name) in
@@ -585,7 +588,8 @@ let emit_function (f: ir_func) =
   
   if needs_frame then (
     Printf.printf ".L_epilogue_%s:\n" f.fname;
-    Printf.printf "    lw ra, -4(fp)\n";
+   if not_leaf then (
+    Printf.printf "    lw ra, -4(fp)\n";);
     Printf.printf "    lw fp, -8(fp)\n";
     Printf.printf "    addi sp, sp, %d\n" framesize;
     Printf.printf "    ret\n"

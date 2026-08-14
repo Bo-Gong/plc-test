@@ -3,7 +3,6 @@
     .globl add
 add:
     addi sp, sp, -16
-    sw ra, 12(sp)
     sw fp, 8(sp)
     addi fp, sp, 16
     sw a0, -12(fp)
@@ -14,7 +13,6 @@ L0:
     lw a0, -16(fp)
     j .L_epilogue_add
 .L_epilogue_add:
-    lw ra, -4(fp)
     lw fp, -8(fp)
     addi sp, sp, 16
     ret
