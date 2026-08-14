@@ -8,7 +8,7 @@ main:
 .LFB0:
 	.cfi_startproc
 	endbr64
-	movl	$15, %eax
+	movl	$10, %eax
 	ret
 	.cfi_endproc
 .LFE0:

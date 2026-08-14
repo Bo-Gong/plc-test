@@ -1,15 +1,13 @@
+// 叶子函数：只做算术运算，不调用别人
+int add(int a, int b) {
+    return a + b;
+}
+
+
 int main() {
-    int i = 0;
-    int n = 100;
-    int a = 5;
-    int b = 3;
-    int c = 2;
-    int sum = 0;
-    
-    while (i < n) {
-        sum = sum + a * b + c;
-        i = i + 1;
-    }
-    
-    return sum;
+    int a = 10;
+    int b = 5;
+    int c = a + b;
+    int d = add(c,3);
+    return d;  // (10+5)+3 = 18
 }
