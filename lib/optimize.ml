@@ -408,6 +408,56 @@
          Assign (d, x)
      | i -> i
    ) instrs
+
+(* constant reassociation: (x + c1) + c2 -> x + (c1 + c2) (wrap32-safe) *)
+let reassoc_consts (instrs: tac list) : tac list =
+  let out = ref [] in
+  let emit i = out := i :: !out in
+  let combine pop pc op c =
+    if op = pop then
+      match op with
+      | Ast.Add -> Some (Ast.Add, wrap32 (pc + c))
+      | Ast.Sub -> Some (Ast.Sub, wrap32 (pc + c))
+      | Ast.Mul -> Some (Ast.Mul, wrap32 (pc * c))
+      | _ -> None
+    else if op = Ast.Add && pop = Ast.Sub then Some (Ast.Add, wrap32 (c - pc))
+    else if op = Ast.Sub && pop = Ast.Add then Some (Ast.Add, wrap32 (pc - c))
+    else None
+  in
+  let prev : (string * Ast.binop * operand * int) option ref = ref None in
+  List.iter (fun i ->
+    match i with
+    | AssignBinOp (d, op, a, Const c) ->
+        let matched = ref false in
+        (match !prev with
+         | Some (pk, pop, px, pc) ->
+             (match op_key a with
+              | Some ak when ak = pk ->
+                  (match combine pop pc op c with
+                   | Some (nop, nc) ->
+                       emit (AssignBinOp (d, nop, px, Const nc));
+                       prev :=
+                         (match op_key d with
+                          | Some dk -> Some (dk, nop, px, nc)
+                          | None -> None);
+                       matched := true
+                   | None -> ())
+              | _ -> ())
+         | None -> ());
+        if not !matched then (
+          emit i;
+          prev :=
+            match op with
+            | Ast.Add | Ast.Sub | Ast.Mul ->
+                (match op_key d with
+                 | Some dk -> Some (dk, op, a, c)
+                 | None -> None)
+            | _ -> None)
+    | i ->
+        emit i;
+        prev := None)
+    instrs;
+  List.rev !out
  
  (* ---------- 尾递归优化 ---------- *)
  
@@ -975,11 +1025,43 @@
            cur (flatten_func f)
        in
        if not (S.equal next cur) then (
-         Hashtbl.replace reads_globals fname next;
-         changed := true))
-       funcs
-   done;
-   let rec eval_func fuel depth fname args =
+        Hashtbl.replace reads_globals fname next;
+        changed := true))
+      funcs
+  done;
+  let writes_globals = Hashtbl.create 16 in
+  List.iter (fun (fname, f) ->
+    let s = ref S.empty in
+    List.iter (fun i ->
+      match def_operand i with
+      | Some (Var v) when not (String.contains v '$') -> s := S.add v !s
+      | _ -> ())
+      (flatten_func f);
+    Hashtbl.replace writes_globals fname !s)
+    funcs;
+  let changed = ref true in
+  while !changed do
+    changed := false;
+    List.iter (fun (fname, f) ->
+      let cur = Hashtbl.find writes_globals fname in
+      let next =
+        List.fold_left (fun s i ->
+          match i with
+          | Call (_, callee, _) ->
+              (match Hashtbl.find_opt writes_globals callee with
+               | Some w -> S.union s w
+               | None -> s)
+          | _ -> s)
+          cur (flatten_func f)
+      in
+      if not (S.equal next cur) then (
+        Hashtbl.replace writes_globals fname next;
+        changed := true))
+      funcs
+  done;
+  let eval_memo : (string, int option) Hashtbl.t = Hashtbl.create 64 in
+  let eval_budget = ref 3000000 in
+  let rec eval_body fuel depth fname args =
      if fuel <= 0 || depth > 16 then None
      else
        match List.assoc_opt fname funcs with
@@ -1010,8 +1092,12 @@
              | Var v -> List.mem v f.params || List.mem v f.locals
              | Const _ -> false
            in
+           let step () =
+             if !eval_budget <= 0 then false
+             else (decr eval_budget; true)
+           in
            let rec run fuel pc =
-             if fuel <= 0 || pc < 0 || pc >= Array.length instrs then None
+             if fuel <= 0 || pc < 0 || pc >= Array.length instrs || not (step ()) then None
              else
                match instrs.(pc) with
                | Label _ -> run (fuel - 1) (pc + 1)
@@ -1067,13 +1153,32 @@
                      args_stack := rem;
                      if List.length call_args <> nargs then None
                      else
-                       (match eval_func (fuel - 1) (depth + 1) callee call_args with
+                       (match eval_body (fuel - 1) (depth + 1) callee call_args with
                         | Some v when set d v -> run (fuel - 1) (pc + 1)
                         | _ -> None)
                | Return (Some a) -> get a
                | Return None -> Some 0
            in
            (try run fuel 0 with Invalid_argument _ -> None)
+   in
+   let eval_func fuel depth fname args =
+     if fuel <= 0 || depth > 16 then None
+     else
+       match List.assoc_opt fname funcs with
+       | None -> None
+       | Some f ->
+           if List.length f.params <> List.length args then None
+           else
+             let key =
+               Printf.sprintf "%s|%s" fname
+                 (String.concat "," (List.map string_of_int args))
+             in
+             match Hashtbl.find_opt eval_memo key with
+             | Some res -> res
+             | None ->
+                 let res = eval_body fuel depth fname args in
+                 Hashtbl.replace eval_memo key res;
+                 res
    in
    let const_arg = function Const n -> Some n | _ -> None in
    let fold_func f =
@@ -1092,6 +1197,9 @@
              && (match Hashtbl.find_opt reads_globals callee with
                  | Some r -> S.is_empty (S.inter r assigned_globals)
                  | None -> false)
+             && (match Hashtbl.find_opt writes_globals callee with
+                 | Some w -> S.is_empty w
+                 | None -> true)
            in
            if can_fold then
              let vals = List.map (function Some v -> v | None -> assert false) arg_vals in
@@ -1112,24 +1220,647 @@
      in
      go [] [] (flatten_func f)
    in
-   List.map (function
-     | Function f -> Function (fold_func f)
-     | GlobalVar _ as g -> g)
-     prog
+  List.map (function
+    | Function f -> Function (fold_func f)
+    | GlobalVar _ as g -> g)
+    prog
+
+(* ---------- rewrite all operand positions ---------- *)
+
+let map_all_operands map = function
+  | Assign (d, s) -> Assign (map d, map s)
+  | AssignBinOp (d, op, a, b) -> AssignBinOp (map d, op, map a, map b)
+  | AssignUnOp (d, op, a) -> AssignUnOp (map d, op, map a)
+  | IfGoto (a, l) -> IfGoto (map a, l)
+  | IfNotGoto (a, l) -> IfNotGoto (map a, l)
+  | Param a -> Param (map a)
+  | Call (d, f, n) -> Call (map d, f, n)
+  | Return (Some a) -> Return (Some (map a))
+  | i -> i
+
+(* compact temp ids to a contiguous range 0..n-1 *)
+let compact_temps (instrs: tac list) : tac list =
+  let mapping = Hashtbl.create 64 in
+  let next = ref 0 in
+  let map = function
+    | Temp t ->
+        (match Hashtbl.find_opt mapping t with
+         | Some t' -> Temp t'
+         | None ->
+             let t' = !next in
+             incr next;
+             Hashtbl.add mapping t t';
+             Temp t')
+    | o -> o
+  in
+  List.map (map_all_operands map) instrs
+
+(* ---------- global side-effect analysis ---------- *)
+
+type func_analysis = {
+  fa_funcs : (string, ir_func) Hashtbl.t;
+  fa_assigned : S.t;
+  fa_reads : (string, S.t) Hashtbl.t;
+  fa_writes : (string, S.t) Hashtbl.t;
+}
+
+let is_global_var v = not (String.contains v '$')
+
+let global_analysis (prog: ir_program) : func_analysis =
+  let funcs = Hashtbl.create 16 in
+  List.iter (function Function f -> Hashtbl.replace funcs f.fname f | _ -> ()) prog;
+  let assigned = ref S.empty in
+  List.iter (function
+    | Function f ->
+        List.iter (fun i ->
+          match def_operand i with
+          | Some (Var v) when is_global_var v -> assigned := S.add v !assigned
+          | _ -> ())
+          (flatten_func f)
+    | GlobalVar _ -> ())
+    prog;
+  let reads = Hashtbl.create 16 in
+  let writes = Hashtbl.create 16 in
+  Hashtbl.iter (fun fname f ->
+    let rs = ref S.empty in
+    let ws = ref S.empty in
+    List.iter (fun i ->
+      iter_operands (function
+        | Var v when is_global_var v -> rs := S.add v !rs
+        | _ -> ()) i;
+      match def_operand i with
+      | Some (Var v) when is_global_var v -> ws := S.add v !ws
+      | _ -> ())
+      (flatten_func f);
+    Hashtbl.replace reads fname !rs;
+    Hashtbl.replace writes fname !ws)
+    funcs;
+  let changed = ref true in
+  while !changed do
+    changed := false;
+    Hashtbl.iter (fun fname f ->
+      let rs = Hashtbl.find reads fname in
+      let ws = Hashtbl.find writes fname in
+      let rs' = ref rs in
+      let ws' = ref ws in
+      List.iter (function
+        | Call (_, callee, _) when Hashtbl.mem funcs callee ->
+            rs' := S.union !rs' (Hashtbl.find reads callee);
+            ws' := S.union !ws' (Hashtbl.find writes callee)
+        | _ -> ())
+        (flatten_func f);
+      if not (S.equal !rs' rs) then (
+        Hashtbl.replace reads fname !rs';
+        changed := true);
+      if not (S.equal !ws' ws) then (
+        Hashtbl.replace writes fname !ws';
+        changed := true))
+      funcs
+  done;
+  { fa_funcs = funcs; fa_assigned = !assigned; fa_reads = reads; fa_writes = writes }
+
+let split_take n xs =
+  let rec go n acc rest =
+    if n <= 0 then List.rev acc, rest
+    else
+      match rest with
+      | [] -> List.rev acc, []
+      | x :: xs -> go (n - 1) (x :: acc) xs
+  in
+  go n [] xs
+
+(* ---------- function inlining ---------- *)
+
+let inline_uniq = ref 1000000
+let inline_temp_uniq = ref 10000000
+
+let has_loop_blocks (all: basic_block list) : bool =
+  let succs = block_succs all in
+  let rec check i = function
+    | [] -> false
+    | j :: js -> j <= i || check i js
+  in
+  let rec go i = function
+    | [] -> false
+    | s :: ss -> check i s || go (i + 1) ss
+  in
+  go 0 succs
+
+let callees_of (funcs: (string, ir_func) Hashtbl.t) (f: ir_func) : S.t =
+  List.fold_left (fun s -> function
+    | Call (_, callee, _) when Hashtbl.mem funcs callee -> S.add callee s
+    | _ -> s)
+    S.empty (flatten_func f)
+
+let is_recursive_func (funcs: (string, ir_func) Hashtbl.t) (name: string) : bool =
+  let seen = ref S.empty in
+  let stack = ref (S.elements (callees_of funcs (Hashtbl.find funcs name))) in
+  let rec go () =
+    match !stack with
+    | [] -> false
+    | x :: rest ->
+        stack := rest;
+        if x = name then true
+        else if S.mem x !seen then go ()
+        else (
+          seen := S.add x !seen;
+          stack := S.elements (callees_of funcs (Hashtbl.find funcs x)) @ !stack;
+          go ())
+  in
+  go ()
+
+let inline_func (f: ir_func) (funcs: (string, ir_func) Hashtbl.t) (inlineable: (string, bool) Hashtbl.t) : ir_func * string list =
+  let out = ref [] in
+  let pending = ref [] in
+  let added = ref [] in
+  let emit i = out := i :: !out in
+  let clone callee dest args =
+    let body = ref [] in
+    let tmap = Hashtbl.create 16 in
+    let vmap = Hashtbl.create 16 in
+    let lmap = Hashtbl.create 16 in
+    let end_lbl = fresh_label () in
+    let emitb i = body := i :: !body in
+    let fresh_t t =
+      match Hashtbl.find_opt tmap t with
+      | Some t' -> t'
+      | None ->
+          let t' = !inline_temp_uniq in
+          incr inline_temp_uniq;
+          Hashtbl.add tmap t t';
+          t'
+    in
+    let fresh_v v =
+      match Hashtbl.find_opt vmap v with
+      | Some v' -> v'
+      | None ->
+          let v' = Printf.sprintf "inl$%d" !inline_uniq in
+          incr inline_uniq;
+          Hashtbl.add vmap v v';
+          added := v' :: !added;
+          v'
+    in
+    let lbl l =
+      match Hashtbl.find_opt lmap l with
+      | Some l' -> l'
+      | None ->
+          let l' = fresh_label () in
+          Hashtbl.add lmap l l';
+          l'
+    in
+    let map_op = function
+      | Temp t -> Temp (fresh_t t)
+      | Var v when String.contains v '$' -> Var (fresh_v v)
+      | o -> o
+    in
+    List.iter2
+      (fun p a -> emitb (Assign (Var (fresh_v p), a)))
+      callee.params args;
+    List.iter (fun i ->
+      match i with
+      | Label l -> emitb (Label (lbl l))
+      | Assign (d, s) -> emitb (Assign (map_op d, map_op s))
+      | AssignBinOp (d, op, a, b) -> emitb (AssignBinOp (map_op d, op, map_op a, map_op b))
+      | AssignUnOp (d, op, a) -> emitb (AssignUnOp (map_op d, op, map_op a))
+      | Goto l -> emitb (Goto (lbl l))
+      | IfGoto (a, l) -> emitb (IfGoto (map_op a, lbl l))
+      | IfNotGoto (a, l) -> emitb (IfNotGoto (map_op a, lbl l))
+      | Param a -> emitb (Param (map_op a))
+      | Call (d, fname, n) -> emitb (Call (map_op d, fname, n))
+      | Return None -> emitb (Assign (dest, Const 0)); emitb (Goto end_lbl)
+      | Return (Some a) -> emitb (Assign (dest, map_op a)); emitb (Goto end_lbl))
+      (flatten_func callee);
+    emitb (Label end_lbl);
+    List.rev !body
+  in
+  let rec go = function
+    | [] ->
+        List.iter (fun p -> emit (Param p)) !pending;
+        (rebuild_func f (compact_temps (List.rev !out)), List.rev !added)
+    | Param a :: rest ->
+        pending := !pending @ [a];
+        go rest
+    | Call (d, callee, nargs) :: rest ->
+        let can_inline =
+          Hashtbl.mem funcs callee
+          && (match Hashtbl.find_opt inlineable callee with Some true -> true | _ -> false)
+          && List.length !pending >= nargs
+          && List.length !out < 2000
+        in
+        if can_inline then (
+          let m = List.length !pending in
+          let front, lastn = split_take (m - nargs) !pending in
+          pending := front;
+          let args = List.rev lastn in
+          let callee_f = Hashtbl.find funcs callee in
+          if List.length callee_f.params = List.length args then
+            List.iter emit (clone callee_f d args)
+          else (
+            List.iter (fun p -> emit (Param p)) lastn;
+            emit (Call (d, callee, nargs)));
+          go rest)
+        else (
+          List.iter (fun p -> emit (Param p)) !pending;
+          pending := [];
+          emit (Call (d, callee, nargs));
+          go rest)
+    | i :: rest ->
+        List.iter (fun p -> emit (Param p)) !pending;
+        pending := [];
+        emit i;
+        go rest
+  in
+  go (flatten_func f)
+
+let inline_calls (prog: ir_program) : ir_program =
+  let prog = ref prog in
+  for _ = 1 to 2 do
+    let analysis = global_analysis !prog in
+    if Hashtbl.length analysis.fa_funcs >= 2 then (
+      let inlineable = Hashtbl.create 16 in
+      Hashtbl.iter (fun name f ->
+        let ok =
+          name <> "main"
+          && List.length (flatten_func f) <= 30
+          && not (is_recursive_func analysis.fa_funcs name)
+          && not (has_loop_blocks (f.entry :: f.blocks))
+          && S.is_empty (Hashtbl.find analysis.fa_writes name)
+        in
+        Hashtbl.replace inlineable name ok)
+        analysis.fa_funcs;
+      let any = ref false in
+      Hashtbl.iter (fun _ ok -> if ok then any := true) inlineable;
+      if !any then
+        prog :=
+          List.map (function
+            | GlobalVar _ as g -> g
+            | Function f ->
+                let nf, added = inline_func f analysis.fa_funcs inlineable in
+                Function
+                  { nf with
+                    locals =
+                      List.filter (fun l -> not (List.mem l added)) nf.locals @ added })
+            !prog)
+  done;
+  !prog
+
+(* ---------- loop invariant code motion ---------- *)
+
+let licm_func (f: ir_func) (writes: (string, S.t) Hashtbl.t) : ir_func =
+  let all = f.entry :: f.blocks in
+  let idx = Hashtbl.create 16 in
+  List.iteri (fun i (b: basic_block) -> Hashtbl.replace idx b.label i) all;
+  let cands = ref [] in
+  List.iteri (fun i (b: basic_block) ->
+    match List.rev b.instrs with
+    | Goto h_lbl :: _ ->
+        (match Hashtbl.find_opt idx h_lbl with
+         | Some h when h < i -> cands := (h, i) :: !cands
+         | _ -> ())
+    | _ -> ())
+    all;
+  let cands = List.rev !cands in
+  if cands = [] then f
+  else
+    let body_size (h, i) =
+      let rec go k acc =
+        if k > i then acc
+        else go (k + 1) (acc + List.length (List.nth all k).instrs)
+      in
+      go h 0
+    in
+    let h, i =
+      List.fold_left
+        (fun best c -> if body_size c < body_size best then c else best)
+        (List.hd cands) (List.tl cands)
+    in
+    if h = 0 then f
+    else
+      let loop_blocks =
+        let rec go k acc =
+          if k > i then List.rev acc
+          else go (k + 1) ((List.nth all k) :: acc)
+        in
+        go h []
+      in
+      let loop_callees = ref S.empty in
+      List.iter (fun (b: basic_block) ->
+        List.iter (function
+          | Call (_, callee, _) -> loop_callees := S.add callee !loop_callees
+          | _ -> ())
+          b.instrs)
+        loop_blocks;
+      let unsafe_globals = ref S.empty in
+      S.iter (fun c ->
+        match Hashtbl.find_opt writes c with
+        | Some w -> unsafe_globals := S.union !unsafe_globals w
+        | None -> ())
+        !loop_callees;
+      let defined = ref S.empty in
+      let def_counts = Hashtbl.create 16 in
+      List.iter (fun (b: basic_block) ->
+        List.iter (fun inst ->
+          match def_operand inst with
+          | Some d ->
+              (match op_key d with
+               | Some k ->
+                   defined := S.add k !defined;
+                   let c = match Hashtbl.find_opt def_counts k with Some c -> c | None -> 0 in
+                   Hashtbl.replace def_counts k (c + 1)
+               | None -> ())
+          | None -> ())
+          b.instrs)
+        loop_blocks;
+      let uses_of = function
+        | Assign (_, y) -> [y]
+        | AssignBinOp (_, _, a, b) -> [a; b]
+        | AssignUnOp (_, _, a) -> [a]
+        | _ -> []
+      in
+      let invariant inst =
+        match inst with
+        | Goto _ | IfGoto _ | IfNotGoto _ | Label _ | Return _ | Param _ | Call _ -> false
+        | Assign _ | AssignBinOp _ | AssignUnOp _ ->
+            let ok = ref true in
+            List.iter (fun o ->
+              match op_key o with
+              | Some k when S.mem k !defined -> ok := false
+              | _ ->
+                  (match o with
+                   | Var v when is_global_var v && S.mem v !unsafe_globals -> ok := false
+                   | _ -> ()))
+              (uses_of inst);
+            if not !ok then false
+            else
+              match def_operand inst with
+              | None -> false
+              | Some d ->
+                  (match d with
+                   | Temp _ ->
+                       (match op_key d with
+                        | None -> false
+                        | Some k ->
+                            if Hashtbl.find_opt def_counts k <> Some 1 then false
+                            else
+                              match inst with
+                              | AssignBinOp (_, (Ast.Div | Ast.Mod), _, b) ->
+                                  (match b with Const c when c <> 0 -> true | _ -> false)
+                              | _ -> true)
+                   | _ -> false)
+      in
+      let hoist = ref [] in
+      List.iter (fun (b: basic_block) ->
+        List.iter (fun inst -> if invariant inst then hoist := (b, inst) :: !hoist) b.instrs)
+        loop_blocks;
+      let hoist = List.rev !hoist in
+      if hoist = [] then f
+      else
+        let is_hoisted inst = List.exists (fun (_, i') -> inst == i') hoist in
+        let new_loop =
+          List.map (fun (b: basic_block) ->
+            { b with instrs = List.filter (fun inst -> not (is_hoisted inst)) b.instrs })
+            loop_blocks
+        in
+        let header_label = (List.nth all h).label in
+        let pre_label = fresh_label () in
+        let pre_instrs = List.map snd hoist in
+        let retarget instrs =
+          List.map (function
+            | Goto l when l = header_label -> Goto pre_label
+            | IfGoto (a, l) when l = header_label -> IfGoto (a, pre_label)
+            | IfNotGoto (a, l) when l = header_label -> IfNotGoto (a, pre_label)
+            | i -> i)
+            instrs
+        in
+        let blocks = ref [] in
+        List.iteri (fun k (b: basic_block) ->
+          if k < h then blocks := { b with instrs = retarget b.instrs } :: !blocks)
+          all;
+        blocks := { label = pre_label; instrs = pre_instrs } :: !blocks;
+        List.iteri (fun k _ ->
+          if k >= h && k <= i then
+            blocks := List.nth new_loop (k - h) :: !blocks)
+          all;
+        List.iteri (fun k (b: basic_block) ->
+          if k > i then blocks := { b with instrs = retarget b.instrs } :: !blocks)
+          all;
+        match List.rev !blocks with
+        | entry :: rest -> { f with entry; blocks = rest }
+        | [] -> f
+
+let licm_loops (prog: ir_program) : ir_program =
+  let analysis = global_analysis prog in
+  List.map (function
+    | Function f -> Function (licm_func f analysis.fa_writes)
+    | GlobalVar _ as g -> g)
+    prog
+
+(* ---------- loop unrolling ---------- *)
+
+let unroll_func (f: ir_func) : ir_func =
+  let factor = 4 in
+  let size_cap = 4000 in
+  let all = f.entry :: f.blocks in
+  let idx = Hashtbl.create 16 in
+  List.iteri (fun i (b: basic_block) -> Hashtbl.replace idx b.label i) all;
+  let cands = ref [] in
+  List.iteri (fun i (b: basic_block) ->
+    match List.rev b.instrs with
+    | Goto h_lbl :: _ ->
+        (match Hashtbl.find_opt idx h_lbl with
+         | Some h when h < i -> cands := (h, i) :: !cands
+         | _ -> ())
+    | _ -> ())
+    all;
+  let cands = List.rev !cands in
+  if cands = [] then f
+  else
+    let body_size (h, i) =
+      let rec go k acc =
+        if k > i then acc
+        else go (k + 1) (acc + List.length (List.nth all k).instrs)
+      in
+      go h 0
+    in
+    let h, i =
+      List.fold_left
+        (fun best c -> if body_size c < body_size best then c else best)
+        (List.hd cands) (List.tl cands)
+    in
+    if body_size (h, i) > 60 then f
+    else
+      let hins = (List.nth all h).instrs in
+      match List.rev hins with
+      | IfNotGoto (cond, exit_l) :: _ ->
+          let loop_labels =
+            let rec go k acc =
+              if k > i then acc
+              else go (k + 1) (S.add (List.nth all k).label acc)
+            in
+            go h S.empty
+          in
+          if S.mem exit_l loop_labels then f
+          else if
+            List.length (flatten_func f) + (factor - 1) * (body_size (h, i) + 1)
+            > size_cap
+          then f
+          else
+            let header_label = (List.nth all h).label in
+            let hpart =
+              match List.rev hins with
+              | _ :: rest -> List.rev rest
+              | [] -> []
+            in
+            let body =
+              let rec go k acc =
+                if k > i then List.rev acc
+                else go (k + 1) ((List.nth all k) :: acc)
+              in
+              go (h + 1) []
+            in
+            let loop_temp_defs = ref IntSet.empty in
+            for k = h to i do
+              List.iter (fun inst ->
+                match def_operand inst with
+                | Some (Temp t) -> loop_temp_defs := IntSet.add t !loop_temp_defs
+                | _ -> ())
+                (List.nth all k).instrs
+            done;
+            let remap_op tmap o =
+              match o with
+              | Temp t when IntSet.mem t !loop_temp_defs ->
+                  (match Hashtbl.find_opt tmap t with
+                   | Some t' -> Temp t'
+                   | None ->
+                       let t' = !inline_temp_uniq in
+                       incr inline_temp_uniq;
+                       Hashtbl.add tmap t t';
+                       Temp t')
+              | o -> o
+            in
+            let map_inst tmap lmap inst =
+              match inst with
+              | Assign (d, s) -> Assign (remap_op tmap d, remap_op tmap s)
+              | AssignBinOp (d, op, a, b) ->
+                  AssignBinOp (remap_op tmap d, op, remap_op tmap a, remap_op tmap b)
+              | AssignUnOp (d, op, a) -> AssignUnOp (remap_op tmap d, op, remap_op tmap a)
+              | Goto target ->
+                  if target = header_label then Goto target
+                  else if S.mem target loop_labels then (
+                    if not (Hashtbl.mem lmap target) then Hashtbl.add lmap target (fresh_label ());
+                    Goto (Hashtbl.find lmap target))
+                  else Goto target
+              | IfGoto (a, target) ->
+                  if target = header_label then IfGoto (remap_op tmap a, target)
+                  else if S.mem target loop_labels then (
+                    if not (Hashtbl.mem lmap target) then Hashtbl.add lmap target (fresh_label ());
+                    IfGoto (remap_op tmap a, Hashtbl.find lmap target))
+                  else IfGoto (remap_op tmap a, target)
+              | IfNotGoto (a, target) ->
+                  if target = header_label then IfNotGoto (remap_op tmap a, target)
+                  else if S.mem target loop_labels then (
+                    if not (Hashtbl.mem lmap target) then Hashtbl.add lmap target (fresh_label ());
+                    IfNotGoto (remap_op tmap a, Hashtbl.find lmap target))
+                  else IfNotGoto (remap_op tmap a, target)
+              | Label l -> Label l
+              | Param a -> Param (remap_op tmap a)
+              | Call (d, fname, n) -> Call (remap_op tmap d, fname, n)
+              | Return (Some a) -> Return (Some (remap_op tmap a))
+              | Return None -> Return None
+            in
+            let clone_instrs drop_last tmap lmap instrs =
+              let len = List.length instrs in
+              let out = ref [] in
+              List.iteri (fun k inst ->
+                let is_last = k = len - 1 in
+                match inst with
+                | Goto _ when drop_last && is_last -> ()
+                | _ -> out := map_inst tmap lmap inst :: !out)
+                instrs;
+              List.rev !out
+            in
+            let new_blocks_rev = ref [] in
+            let push b = new_blocks_rev := b :: !new_blocks_rev in
+            for _ = 1 to factor - 1 do
+              let tmap = Hashtbl.create 16 in
+              let lmap = Hashtbl.create 16 in
+              List.iter (fun (bb: basic_block) ->
+                if not (Hashtbl.mem lmap bb.label) then
+                  Hashtbl.add lmap bb.label (fresh_label ()))
+                body;
+              let hp =
+                clone_instrs false tmap lmap hpart
+                @ [IfNotGoto (remap_op tmap cond, exit_l)]
+              in
+              push { label = fresh_label (); instrs = hp };
+              List.iteri (fun k (bb: basic_block) ->
+                let drop = k = List.length body - 1 in
+                let instrs = clone_instrs drop tmap lmap bb.instrs in
+                push { label = Hashtbl.find lmap bb.label; instrs })
+                body
+            done;
+            let tmap = Hashtbl.create 16 in
+            let lmap = Hashtbl.create 16 in
+            List.iter (fun (bb: basic_block) ->
+              if not (Hashtbl.mem lmap bb.label) then
+                Hashtbl.add lmap bb.label (fresh_label ()))
+              body;
+            List.iter (fun (bb: basic_block) ->
+              let instrs = clone_instrs false tmap lmap bb.instrs in
+              push { label = Hashtbl.find lmap bb.label; instrs })
+              body;
+            let prefix =
+              List.mapi (fun k (b: basic_block) ->
+                if k = i then
+                  { b with
+                    instrs =
+                      (match List.rev b.instrs with
+                       | _ :: rest -> List.rev rest
+                       | [] -> []) }
+                else b)
+                (List.filteri (fun k _ -> k <= i) all)
+            in
+            let suffix =
+              List.filteri (fun k _ -> k > i) all
+            in
+            let all_new = prefix @ List.rev !new_blocks_rev @ suffix in
+            (match all_new with
+             | entry :: blocks ->
+                 rebuild_func f
+                   (compact_temps (flatten_func { f with entry; blocks }))
+             | [] -> f)
+      | _ -> f
+
+let unroll_loops (prog: ir_program) : ir_program =
+  List.map (function
+    | Function f -> Function (unroll_func f)
+    | GlobalVar _ as g -> g)
+    prog
+
+let repeat_pass n pass prog =
+  let rec go k p =
+    if k <= 0 then p
+    else
+      let p' = pass p in
+      if p' = p then p else go (k - 1) p'
+  in
+  go n prog
  
  (* ---------- 优化管道 ---------- *)
  
- let optimize_linear (params: string list) (instrs: tac list) : tac list =
-   instrs
-   |> single_assign_const_prop params
-   |> const_fold
-   |> algebra_simplify
-   |> copy_prop
-   |> common_subexpr
-   |> copy_prop
-   |> single_assign_const_prop params
-   |> const_fold
-   |> algebra_simplify
+let optimize_linear (params: string list) (instrs: tac list) : tac list =
+  instrs
+  |> single_assign_const_prop params
+  |> const_fold
+  |> algebra_simplify
+  |> reassoc_consts
+  |> copy_prop
+  |> common_subexpr
+  |> copy_prop
+  |> single_assign_const_prop params
+  |> const_fold
+  |> algebra_simplify
+  |> reassoc_consts
  
  let rec repeat_linear (params: string list) n instrs =
    if n <= 0 then instrs
@@ -1164,16 +1895,20 @@
    f
  
  (* 对整个 IR 程序做优化：逐个函数处理，全局变量保持不变 *)
- let optimize_program (prog: ir_program) : ir_program =
-   let prog = global_const_prop prog in
-   let prog =
-     List.map (function
-       | GlobalVar _ as g -> g
-       | Function f -> Function (optimize_func f))
-       prog
-   in
-   let prog = const_eval_program prog in
-   List.map (function
-     | GlobalVar _ as g -> g
-     | Function f -> Function (optimize_func f)
-   ) prog
+let optimize_program (prog: ir_program) : ir_program =
+  let optimize_all prog =
+    List.map (function
+      | GlobalVar _ as g -> g
+      | Function f -> Function (optimize_func f))
+      prog
+  in
+  let prog = global_const_prop prog in
+  let prog = optimize_all prog in
+  let prog = inline_calls prog in
+  let prog = optimize_all prog in
+  let prog = repeat_pass 6 licm_loops prog in
+  let prog = optimize_all prog in
+  let prog = repeat_pass 3 unroll_loops prog in
+  let prog = optimize_all prog in
+  let prog = const_eval_program prog in
+  optimize_all prog
